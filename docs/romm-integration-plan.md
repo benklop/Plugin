@@ -130,8 +130,7 @@ token. This is a requirement, not an optional extra. There is no shared-account 
   users (pick from `GET /users` with an admin token) and send each a pairing request. Optional
   auto-match by identical username or email, which the admin confirms. The user still approves the
   token, so the plugin never holds a RomM password.
-- **Optional SSO later:** if both servers use the same OIDC provider, the association can be made
-  automatically. This is out of scope for v1.
+- **Automatic association** when both servers share an identity provider (OIDC or LDAP): see 2a.
 - **Unlinked users:** they see a "Link your RomM account to play" card instead of the library.
   The admin token is used only for server-level work (test connection, listing RomM users for
   mapping, artwork cache warmup) and never to read or write user data.
@@ -145,6 +144,96 @@ token. This is a requirement, not an optional extra. There is no shared-account 
   devices.read devices.write roms.user.read roms.user.write me.read`.
 - Visibility comes for free: because calls are made as the user, RomM enforces hidden ROMs and
   platforms, and the `streaming` permission grant, itself.
+
+### 2a. Automatic association through a shared identity provider
+
+When Jellyfin/Emby and RomM authenticate against the same directory or IdP, the plugin should
+connect a user to their RomM account without the user doing anything, or at most one tap. That
+splits into two problems: **matching** the identities, and **getting a RomM token** for the
+matched account.
+
+**What each side supports today**
+
+| Server | OIDC | LDAP |
+|---|---|---|
+| RomM | Built in (`OIDC_*` env). Users carry `oidc_issuer` + `oidc_sub` (unique index), the username comes from `OIDC_USERNAME_ATTRIBUTE` (default `preferred_username`), and email is IdP-managed (`email_managed_by_oidc`). `/api/heartbeat` reports `OIDC.ENABLED` and `PROVIDER`. | **None.** A directory reaches RomM only through an OIDC IdP that federates it (Authentik, Keycloak, Authelia+LLDAP, Zitadel, …). |
+| Jellyfin | SSO-Auth plugin (OIDC), which keeps a per-provider link from IdP subject to Jellyfin user | LDAP-Auth plugin. The user's auth provider is the LDAP provider and the username is the configured LDAP uid attribute. |
+| Emby | No OIDC | LDAP plugin, if installed |
+
+So the supported shapes are:
+
+| Shape | Match key (strongest first) |
+|---|---|
+| OIDC on both, same IdP | `(issuer, sub)` exact. Falls back to verified email, then `preferred_username`. |
+| LDAP on Jellyfin/Emby, OIDC on RomM through an IdP backed by the same directory | The directory attribute both sides expose: email (`mail` ⇄ `email` claim) or username (`uid`/`sAMAccountName` ⇄ `preferred_username`). The admin picks which. |
+| Anything else | Manual or admin-assisted linking (section 2) |
+
+**Matching rules (plugin)**
+
+- The admin turns on "Auto-link RomM accounts" and chooses the match keys allowed. Matching runs on
+  a user's first RomM request, on login, and in a scheduled task that pre-links everyone.
+- Jellyfin identity: the SSO-Auth link for `(issuer, sub)`, the LDAP username, and the user's
+  email. Each is read only if that auth plugin owns the user, so a local Jellyfin account never
+  auto-links by name. The SSO-Auth and LDAP-Auth data is read through their stored configuration.
+  This is another plugin's internal format, so it sits behind an adapter with tests, and auto-link
+  is disabled if the format isn't recognised.
+- RomM identity: `GET /api/users` with the admin token gives username and email. `(issuer, sub)` is
+  stored but not returned by `UserSchema` today, so exact-subject matching needs the small upstream
+  addition below. Until then the match is on email or username.
+- Safety:
+  - Only link to RomM users that are IdP-managed (`email_managed_by_oidc` true, or
+    `has_password` false). A local RomM account that happens to share a name is never matched.
+  - Exactly one candidate, or no link. Ambiguous cases go to the admin's review list.
+  - The one-to-one rule from section 2 still holds.
+  - Every auto-link is recorded (who, which key, when) and shown in the Accounts table, where the
+    admin can undo it.
+- Provisioning: if the user has no RomM account yet and RomM has `OIDC_ALLOW_REGISTRATION`
+  on, the account is created the first time they pass through RomM's OIDC login (path B below).
+  Otherwise they stay unlinked with a "No RomM account" status.
+
+**Getting a token for the matched account**
+
+RomM currently has no way for a third party to obtain a token for another user. Client tokens
+are minted only by their owner, `client_credentials` is an unimplemented TODO in `/api/token`, and
+there's no token-exchange grant. So the plan has a path that works today and a fully automatic
+path that needs a small upstream RomM feature:
+
+- **B. One-tap, works today.** Matching is automatic, and only the approval needs the user. The
+  plugin starts the device flow already targeted at the matched account. Where the client has a
+  browser surface (Core on desktop/mobile/Android TV, the web app), it opens RomM's approval page
+  in a WebView. With `OIDC_AUTOLOGIN` on and an existing IdP session, that is sign-in-free, and the
+  user taps "Approve". On TVs the QR code goes to the phone, where the IdP session usually already
+  exists. Either way there's no password and no account choice. The plugin checks the approved
+  token's `/api/users/me` against the expected match and rejects a token for the wrong account.
+- **A. Fully automatic, needs RomM upstream (recommended proposal).** Delegated token issuance for a
+  trusted service:
+  - A new admin-grantable scope (e.g. `users.tokens.delegate`) on a client token the admin
+    creates for Moonbase.
+  - `POST /api/client-tokens/delegate {user: {id | oidc_issuer+oidc_sub | username}, scopes,
+    device_name}` returns a client token owned by that user. Scopes are capped to the
+    delegator's own and to a non-admin allow-list, and the call is refused for admin users.
+  - The token appears in the user's own token list labelled "issued by Moonbase", and they can
+    revoke it. Each issuance writes an audit event (RomM already audits token creation).
+  - `UserSchema` exposes `oidc_issuer`/`oidc_sub` to `users.read` callers, for exact matching.
+
+  This works for every shape above, LDAP included, because trust comes from the admin who
+  configured both servers rather than from a user-presented token. It fits RomM's existing
+  `ClientToken` model and is roughly an endpoint plus a scope plus tests. The plugin detects it
+  through RomM's version and OpenAPI, and uses A when present, otherwise B.
+- **C. Considered, not chosen: RFC 8693 token exchange** with the user's IdP token. This is the
+  cleanest trust model, but Moonbase never holds the user's IdP token. Jellyfin's SSO plugin
+  doesn't share it, and LDAP logins have none. Getting one would mean IdP-side impersonation,
+  which only some IdPs support. Worth revisiting if RomM adds token exchange for its own reasons.
+
+**Lifecycle**
+
+- Re-validate on each Jellyfin login and in the scheduled task:
+  - The RomM user is disabled or deleted, or the IdP subject changed: the association moves to
+    "needs re-link".
+  - The Jellyfin user is deleted or disabled: the plugin revokes its RomM token (`DELETE
+    /client-tokens/{id}` as the user) and drops the association.
+- Group/role mapping stays each server's own business. RomM's `OIDC_ROLE_*` decides RomM
+  permissions, including the `streaming` grant, and Moonbase never escalates them.
 
 ### 3. Plugin: browse, metadata, artwork
 
@@ -343,8 +432,12 @@ formats). That cross-mode continuity is the main payoff of syncing to RomM rathe
   platforms, whether streaming is enabled and the platforms its containers serve, read live from
   RomM), per-platform enable list, artwork cache limit.
 - Accounts: a table of Jellyfin/Emby users with their linked RomM account, link status (linked,
-  pending, needs re-link) and last sync. Actions: map to a RomM user, auto-match by
-  username/email, send pairing request, unlink.
+  auto-linked, pending approval, ambiguous, no RomM account, needs re-link), how the match was made,
+  and last sync. Actions: map to a RomM user, send pairing request, unlink.
+- Identity: auto-link on/off, which match keys are allowed (OIDC subject / email / username), the
+  detected setup (e.g. "Jellyfin: SSO-Auth (OIDC) · RomM: OIDC via Authentik"), whether RomM
+  supports delegated tokens (fully automatic) or one-tap approval is used, and a dry-run button
+  that previews the matches before enabling.
 - Streaming: on/off, proxy the room (default on), TURN server info shown to clients, idle timeout.
   There's no per-platform streaming list here. That lives in RomM's container config.
 - Migration helper: for users who move a filesystem library to RomM, an optional task that matches
@@ -370,13 +463,19 @@ Report unsupported features in the admin "Test connection" output rather than fa
 | Phase | Scope | Result |
 |---|---|---|
 | 0 | `IGameSource` refactor, no behavior change. `shared/Romm` client + config + test connection. | Groundwork, safe to merge alone. |
-| 1 | Account association (device flow + admin mapping), device registration, then RomM browse/metadata/artwork + ROM/BIOS proxy as the linked user, per-user game data (status, rating, last played, rows). | Every client except Roku can browse and play RomM games locally, each user seeing their own RomM data. |
+| 1 | Account association (device flow + admin mapping + auto-matching with one-tap approval), device registration, then RomM browse/metadata/artwork + ROM/BIOS proxy as the linked user, per-user game data (status, rating, last played, rows). | Every client except Roku can browse and play RomM games locally, each user seeing their own RomM data. |
 | 2 | States to RomM, SRAM sync in Core and Smart-TV, conflict UI, playtime ingest with offline queue. | Saves and playtime round-trip with RomM and other RomM clients. |
 | 3 | Play-mode decision + config-driven streaming endpoints + Core stream player (direct room URL, LAN). | Any platform RomM has a container for is playable on Core devices without downloading. |
 | 4 | Room reverse proxy + remote-key bridge + Smart-TV stream player. | Streaming on webOS/Tizen, with the containers not exposed. |
-| 5 | Roku games UI (browse). LL-HLS spike. Multi-disc lazy download. Save migration task. | Rounds out coverage. |
+| 5 | Fully automatic linking via the upstream RomM delegated-token feature, once merged (propose the PR alongside phase 1). Roku games UI (browse). LL-HLS spike. Multi-disc lazy download. Save migration task. | Rounds out coverage. |
 
 ## Risks and open questions
+
+- **Upstream dependency for zero-touch linking:** fully automatic linking needs the RomM
+  delegated-token feature (2a, path A). Without it the best is one tap. Open the discussion with
+  RomM maintainers early.
+- **Reading other plugins' data:** the SSO-Auth and LDAP-Auth link and username data aren't a public
+  API. Keep that behind an adapter that fails closed to manual linking.
 
 - **Association mismatches:** two Jellyfin users wanting one RomM account (e.g. a shared family
   login) would merge saves and playtime. The one-to-one rule blocks this. The admin UI should
