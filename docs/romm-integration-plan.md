@@ -7,11 +7,16 @@ Status: proposal. Covers the Moonbase plugin (Jellyfin and Emby), Moonfin Core, 
 Let a Moonbase admin point the plugin at a [RomM](https://github.com/rommapp/romm) server so that:
 
 1. **ROMs, BIOS/firmware and all metadata/artwork come from RomM**, not from a folder walk.
-2. **Saves (SRAM) and save states sync back to RomM**, per user, so they line up with the user's
-   other RomM clients (RomM web player, RetroArch/Grout/handheld sync clients).
-3. **RomM's server-side emulator streaming** is a first-class play mode. This is for systems too
-   heavy for the client, and for systems like PSX whose disc images are too big to download to a
-   TV (Smart-TV caps a ROM at 48 MB, Roku has no local emulator at all).
+2. **Every Jellyfin/Emby user is associated with their own RomM account.** RomM keeps saves, states,
+   playtime and personal game data (status, rating, backlog, now playing, last played, hidden) per
+   RomM user, so all of it is read and written as that user.
+3. **Saves (SRAM), save states, playtime and personal game data sync both ways with RomM**, so they
+   line up with the user's other RomM clients (RomM web player, RetroArch/Grout/handheld sync clients).
+4. **RomM's server-side emulator streaming** is a first-class play mode. It covers any platform the
+   RomM admin has configured a streaming container for. That includes systems too heavy for the client,
+   and systems like PSX whose disc images are too big to download to a TV (Smart-TV caps a ROM at
+   48 MB, Roku has no local emulator at all). Moonfin does not keep its own list of streamable
+   platforms. It reflects whatever RomM's container config offers.
 
 The plan is based on RomM `master` as of late October 2026 (5.4.x line). RomM's API changes between
 minor versions, so the plugin has to read the server version and gate features on it (see
@@ -51,12 +56,16 @@ All under `/api`. Auth is a Bearer token: a RomM client API token (`rmm_…`) or
 | Memory cards (PS1/PS2 etc.) | `/memory-cards` |
 | Devices + sync tracking | `POST /devices` (`devices.write`), `POST /saves/{id}/downloaded`, `/saves/{id}/track`, `POST /sync/negotiate` |
 | Pairing a user without a password | Device authorization flow: `POST /auth/device/init` returns `user_code` + `device_code`, the user approves on the RomM web UI (QR at `/pair/device`), and polling `POST /auth/device/token` returns a client token bound to a RomM device. |
-| Play time | `POST /play-sessions` |
+| Per-user game data | `RomUserSchema` on every ROM response (`rom_user`: `last_played`, `now_playing`, `backlogged`, `hidden`, `rating`, `difficulty`, `completion`, `status`), written with `PUT /roms/{id}/props` (`roms.user.write`, `update_last_played=true` stamps last played) |
+| Play time | `POST /play-sessions` `{device_id, sessions:[{rom_id, save_slot, start_time, end_time, duration_ms}]}`, `GET /play-sessions` (`roms.user.read/write`). Streamed sessions record their own play session and last-played server-side. |
 | Streaming | `GET /streaming/config` (which platforms have a container, plus capabilities), `POST /streaming/sessions` (`{rom_id, state_id?, save_id?, memory_card_id?}`, answers 202), `GET /streaming/sessions/{platform}/status` (gives the room `host` URL once launched), `…/heartbeat`, `…/save-state`, `…/load-state`, `…/swap-disc`, `…/save-and-exit`, `DELETE /streaming/sessions/{platform}` |
 
 Streaming itself runs as RomM-managed containers ("webstation" + `romm-broker`). Each container runs
-a native emulator (SwanStation for PSX, PCSX2, Dolphin, Flycast, RetroArch cores, …) and streams it
-to a **browser** over WebRTC via a Selkies web UI. The room URL is that Selkies page.
+an emulator (SwanStation for PSX, PCSX2, Dolphin, Flycast, any RetroArch core, …) and streams it
+to a **browser** over WebRTC via a Selkies web UI. The room URL is that Selkies page. Which
+platforms stream is purely RomM configuration: a container can serve any platform its emulator
+handles. `GET /streaming/config` returns one row per streamable platform, with its emulator,
+label and per-platform capabilities (save slots, live states, memory cards, save picker, import kinds).
 
 ## Architecture decision: the plugin is the RomM adapter
 
@@ -101,33 +110,49 @@ could be added later for Core alone, if a Jellyfin-less use case ever matters.
   and Emby share them. That covers paging, Range passthrough, version detection, typed errors for
   409/428 and the scope list.
 
-### 2. Plugin: accounts and auth
+### 2. Plugin: account association (one RomM account per user)
 
-RomM saves are per RomM user, so each Jellyfin/Emby user needs a RomM identity.
+RomM is multi-user: saves, states, playtime, play sessions and the per-ROM user data all belong
+to a RomM user. So **every Jellyfin/Emby user who uses a RomM library is associated with exactly
+one RomM account**, and every RomM call made for that user (browse included) uses that account's
+token. This is a requirement, not an optional extra. There is no shared-account mode for user data.
 
-- **Per-user link (default):** a "Link RomM account" action in the client settings. The plugin
-  starts the RomM device flow on the user's behalf. The client shows the `user_code` and a QR code
-  (TV-friendly, no typing), and the user approves on their phone. The plugin polls `/auth/device/token` and
-  stores the resulting client token **encrypted, keyed by Jellyfin user id**. This creates one
-  RomM device per Moonfin user per client device (see sync below), and the user can revoke it in
-  RomM.
-- **Shared admin token (fallback):** the admin enters one RomM token. Browse and play work for
-  everyone, but saves are either disabled or stored on the Moonbase side (today's
-  `GameSavesService`) and never pushed to RomM. That way one RomM user's saves are never mixed
-  across Jellyfin users.
-- **Optional SSO later:** if both servers use the same OIDC provider, map identities automatically.
-  This is out of scope for v1.
-- Request the minimum scopes: `roms.read platforms.read firmware.read assets.read assets.write
-  devices.read devices.write roms.user.read roms.user.write`.
-- Respect RomM visibility: always call RomM *as the linked user*, so hidden ROMs and platforms and
-  the `streaming` permission are enforced by RomM itself. Unlinked users fall back to the admin
-  token, read-only.
+- **Association record.** The plugin stores `{jellyfinUserId → rommUserId, rommUsername, clientToken
+  (encrypted), linkedAt, scopes}` in plugin data. It is one-to-one: a RomM account can't be linked to
+  two Jellyfin users. Otherwise their saves and playtime would merge.
+- **Linking (user-initiated):** a "Link RomM account" action in each client's settings, and a prompt
+  the first time an unlinked user opens a RomM library. The plugin starts RomM's device
+  authorization flow on the user's behalf. The client shows the `user_code` and a QR code
+  (TV-friendly, no typing), and the user signs in and approves on their phone. The plugin polls
+  `/auth/device/token` and stores the client token. On servers without the device flow, the user
+  pastes a RomM pair code instead (`/client-tokens/exchange`).
+- **Linking (admin-assisted):** on the plugin config page, the admin can map Jellyfin users to RomM
+  users (pick from `GET /users` with an admin token) and send each a pairing request. Optional
+  auto-match by identical username or email, which the admin confirms. The user still approves the
+  token, so the plugin never holds a RomM password.
+- **Optional SSO later:** if both servers use the same OIDC provider, the association can be made
+  automatically. This is out of scope for v1.
+- **Unlinked users:** they see a "Link your RomM account to play" card instead of the library.
+  The admin token is used only for server-level work (test connection, listing RomM users for
+  mapping, artwork cache warmup) and never to read or write user data.
+- **Devices:** each Moonfin client device a user plays on is registered as a RomM device under that
+  user (`POST /devices`, name like "Moonfin – Living room webOS"). Its id is sent with saves and play
+  sessions, so RomM's conflict tracking and device list work. The user can see and revoke these in RomM.
+- **Unlink / revoke:** unlinking deletes the stored token, and RomM-side revocation surfaces as `401`.
+  On `401` the plugin marks the association as needing a re-link, and clients show the link prompt
+  again instead of failing. Local Moonbase data for that user is not touched.
+- Scopes requested: `roms.read platforms.read firmware.read assets.read assets.write
+  devices.read devices.write roms.user.read roms.user.write me.read`.
+- Visibility comes for free: because calls are made as the user, RomM enforces hidden ROMs and
+  platforms, and the `streaming` permission grant, itself.
 
 ### 3. Plugin: browse, metadata, artwork
 
-- Systems: map RomM `platform.slug` to Moonfin system ids and cores through a new table next to
-  `GameSystemCoreResolver` (e.g. `psx → psx/pcsx_rearmed`, `snes → snes`, `ngc → none-local`).
-  Platforms with no local core are still listed, but marked stream-only.
+- Systems: map RomM `platform.slug` to Moonfin system ids and local cores through a new table next
+  to `GameSystemCoreResolver` (e.g. `psx → psx/pcsx_rearmed`, `snes → snes`). That table only
+  answers "is there a local core". Every RomM platform the user can see is listed, whether or not it
+  has a local core, and whether it can stream comes from `/streaming/config` (see 7). A platform
+  with neither is listed but marked "not playable here".
 - Games: map `RomSchema` to `GameSummary`/`GameDetail` (name, summary, genres, companies,
   franchises, regions, release year, players, rating, alternative names, revision, size). RomM
   already merges IGDB, ScreenScraper, MobyGames, LaunchBox and other sources, so **RDB and LaunchBox
@@ -137,6 +162,13 @@ RomM saves are per RomM user, so each Jellyfin/Emby user needs a RomM identity.
   `GameArtworkStore`, so TVs never hit RomM directly. Extend `GameDetail` with optional fields
   clients can adopt over time: `screenshots[]`, `manualUrl`, `videoId`, `achievementsId` (`ra_id`),
   `similar[]`.
+- Per-user game data: map `rom_user` onto `GameDetail.userData` (`lastPlayed`, `nowPlaying`,
+  `backlogged`, `hidden`, `rating`, `difficulty`, `completion`, `status`, plus total playtime from
+  `/play-sessions`). Clients get "Continue playing" (by `last_played`), "Backlog" and "Favorites"
+  rows and status/rating controls on the details screen. Edits go through
+  `PUT /Moonfin/Games/{lib}/Games/{id}/UserData`, which writes `PUT /roms/{id}/props` as the user.
+  RomM is the source of truth, and Moonbase stores none of this for RomM games. Moonfin's existing
+  personal rating maps to RomM `rating`.
 - Caching: cache RomM list responses per user for a short time, and refresh when RomM's scan
   completes. RomM has socket events for this, but a periodic poll is simpler for v1.
 
@@ -184,8 +216,13 @@ Work items:
   handheld, the core *and* close core versions must match. Treat states as "same-core only" and
   show the core name on each slot. SRAM generally carries across cores of the same system and is
   what should be relied on.
-- **Play time:** post a `/play-sessions` entry on exit. It's cheap and makes RomM's "continue
-  playing" and stats reflect Moonfin play.
+- **Play time and last played:** local play records a session in the client (start, end and
+  active duration, with paused/backgrounded time excluded). The plugin ingests it to RomM with
+  `POST /play-sessions` (with `device_id`) and stamps `PUT /roms/{id}/props?update_last_played=true`.
+  It also sets `now_playing`, if the user's setting allows. Sessions are queued on the device and
+  retried, so offline play still counts once the device reconnects. Streamed sessions are already
+  recorded server-side by RomM's streaming lifecycle, so the plugin **must not** post a duplicate for
+  them.
 
 ### 6. Choosing the play mode: local vs streamed
 
@@ -204,11 +241,12 @@ and the client applies its own constraints.
 Client rule, in order:
 
 1. Use the user's per-game override if set (extends today's `Backend` override with `stream`).
-2. Use local if a core exists on this device **and** `downloadBytes` fits the device budget (Smart-TV:
-   the current 48 MB blob ceiling. Core: free cache space with headroom, plus a per-platform setting
-   such as "never download disc systems on this device") **and** the platform isn't marked
-   heavy for this device class (e.g. PS2/GC/Wii are always stream on TVs).
-3. Otherwise stream, if `stream.available`.
+2. Use local if a local core exists on this device for the platform **and** `downloadBytes` fits the
+   device budget (Smart-TV: the current 48 MB blob ceiling. Core: free cache space with headroom,
+   plus a per-device "maximum download size").
+3. Otherwise stream, if `stream.available`. That is true for any platform RomM has a container
+   for, including platforms Moonfin has no local core for at all (PS2, GameCube, Wii, Wii U, PS3,
+   3DS, …).
 4. Otherwise show "Can't play on this device" with the reason.
 
 User settings: **Play mode = Auto / Prefer local / Prefer streaming**, plus a per-device
@@ -217,10 +255,19 @@ space can still download and play it natively.
 
 ### 7. Server-side emulation (streaming)
 
+**Platform coverage is data-driven.** The plugin keeps no list of streamable platforms or
+emulators. It reads `/streaming/config` as the linked user (so RomM's `streaming` permission and
+platform visibility apply), caches it briefly, and marks `playModes.stream` on every game whose
+`platform_slug` has a row. Labels ("SwanStation", "RA PPSSPP") and capabilities come from the
+same rows. When the RomM admin adds a container for a new platform, it shows up in Moonfin with no
+plugin or client release. Clients render the in-game menu from capabilities only: save/load
+slots if `max_slots`/`supports_live_states`, disc swap if supported, memory-card picker if
+`supports_memory_cards`. Nothing is keyed off a platform name.
+
 **Plugin endpoints** (thin, authenticated wrappers around RomM's streaming API, called as the
 linked user):
 
-- `GET /Moonfin/Games/Streaming/Config` → which platforms stream, and their capabilities.
+- `GET /Moonfin/Games/Streaming/Config` → the streamable platforms and their capabilities, as RomM reports them.
 - `POST /Moonfin/Games/{lib}/Games/{id}/Stream` `{stateId?, saveId?, memoryCardId?}` → claims a
   session. Pass RomM's `409` (all containers busy) and `428` (memory-card import prompt) through
   as structured errors.
@@ -246,7 +293,7 @@ are visible to any `roms.read` user. Plan:
 
 **Session lifecycle in clients:**
 
-1. Claim → status poll with a "Starting SwanStation…" screen showing RomM's launch phases (large
+1. Claim → status poll with a "Starting <emulator label>…" screen showing RomM's launch phases (large
    titles unpack first).
 2. Open the room in a WebView (Core: reuse the EmulatorJS WebView host, Android TV/desktop/iOS
    WebViews all have WebRTC) or a full-screen iframe (Smart-TV: webOS and Tizen builds with WebRTC.
@@ -254,8 +301,8 @@ are visible to any `roms.read` user. Plan:
 3. Heartbeat every ~15–30 s while visible. Pause/background → `save-and-exit` after a grace period,
    because containers are scarce. Exit → `save-and-exit` (`wait: true`), then return to details.
 4. The resume picker uses RomM states for the container's emulator namespace (from `/streaming/states/{rom_id}`).
-   For PSX via SwanStation there are no live slots, only the exit autosave, so the in-game menu
-   hides Save/Load state where `supports_live_states` is false and shows just "Save & quit".
+   The in-game menu follows the platform's capabilities. For example, PSX via SwanStation has no
+   live slots, only the exit autosave, so the menu shows just "Save & quit".
 
 **Saves interop with streaming.** A streamed session's saves are written to RomM by the broker
 itself. Because they share RomM's save model, a PSX game saved on a streamed session will show up
@@ -292,11 +339,14 @@ formats). That cross-mode continuity is the main payoff of syncing to RomM rathe
 
 ### 9. Admin UX (plugin config page)
 
-- RomM tab: URL, admin/fallback token, "Test connection" (shows RomM version, platforms, whether
-  streaming is enabled and which containers exist), per-platform enable list, artwork cache
-  limit.
-- Save policy: RomM per-user (requires link) / Moonbase local.
+- RomM tab: URL, admin token (server-level tasks only), "Test connection" (shows RomM version,
+  platforms, whether streaming is enabled and the platforms its containers serve, read live from
+  RomM), per-platform enable list, artwork cache limit.
+- Accounts: a table of Jellyfin/Emby users with their linked RomM account, link status (linked,
+  pending, needs re-link) and last sync. Actions: map to a RomM user, auto-match by
+  username/email, send pairing request, unlink.
 - Streaming: on/off, proxy the room (default on), TURN server info shown to clients, idle timeout.
+  There's no per-platform streaming list here. That lives in RomM's container config.
 - Migration helper: for users who move a filesystem library to RomM, an optional task that matches
   Moonbase saves to RomM ROMs by hash and uploads them.
 
@@ -320,13 +370,17 @@ Report unsupported features in the admin "Test connection" output rather than fa
 | Phase | Scope | Result |
 |---|---|---|
 | 0 | `IGameSource` refactor, no behavior change. `shared/Romm` client + config + test connection. | Groundwork, safe to merge alone. |
-| 1 | RomM browse/metadata/artwork + ROM/BIOS proxy with admin token. | Every client except Roku can browse and play RomM games locally. |
-| 2 | Per-user linking (device flow), states to RomM, SRAM sync in Core and Smart-TV, conflict UI, play sessions. | Saves round-trip with RomM and other RomM clients. |
-| 3 | Play-mode decision + streaming control endpoints + Core stream player (direct room URL, LAN). | PSX/PS2/GC playable on Core TVs without downloading. |
+| 1 | Account association (device flow + admin mapping), device registration, then RomM browse/metadata/artwork + ROM/BIOS proxy as the linked user, per-user game data (status, rating, last played, rows). | Every client except Roku can browse and play RomM games locally, each user seeing their own RomM data. |
+| 2 | States to RomM, SRAM sync in Core and Smart-TV, conflict UI, playtime ingest with offline queue. | Saves and playtime round-trip with RomM and other RomM clients. |
+| 3 | Play-mode decision + config-driven streaming endpoints + Core stream player (direct room URL, LAN). | Any platform RomM has a container for is playable on Core devices without downloading. |
 | 4 | Room reverse proxy + remote-key bridge + Smart-TV stream player. | Streaming on webOS/Tizen, with the containers not exposed. |
 | 5 | Roku games UI (browse). LL-HLS spike. Multi-disc lazy download. Save migration task. | Rounds out coverage. |
 
 ## Risks and open questions
+
+- **Association mismatches:** two Jellyfin users wanting one RomM account (e.g. a shared family
+  login) would merge saves and playtime. The one-to-one rule blocks this. The admin UI should
+  explain why and suggest separate RomM users.
 
 - **WebRTC through a proxy:** signaling proxies fine, media does not. Remote play needs TURN, and the
   plan must document that clearly. Confirm Selkies works with a path prefix behind the plugin.
