@@ -369,11 +369,14 @@ linked user):
 #3968 points out that this currently means publishing the emulator desktop, and that the host URLs
 are visible to any `roms.read` user. Plan:
 
-- v1: the plugin **reverse-proxies the room's HTTP and WebSocket signaling** under
+- v1: the plugin **reverse-proxies the room page and its control WebSocket** under
   `/Moonfin/Games/Streaming/Room/{session}/…`, gated by Jellyfin/Emby auth *and* by the session
-  belonging to the caller. Only the WebRTC media goes direct (UDP, or TURN for remote play). The
-  admin then only exposes Jellyfin plus a TURN server, not the containers. Document the
-  TURN requirement for play outside the LAN.
+  belonging to the caller. The admin then exposes Jellyfin (plus TURN for remote play), not the
+  containers. **Media must not follow that path.** RomM's webstation is built on LinuxServer's
+  Selkies base image, whose **default transport is WebSockets**: video and audio travel over the
+  same HTTP port as the page, so a page proxy would carry the stream. Moonfin therefore requires
+  the container to run in Selkies' WebRTC mode for Moonfin streaming. WebSocket mode is
+  supported only on the LAN, through the direct room URL. See 7b.
 - The same-origin proxy also lets Moonfin inject its own bridge script into the room page:
   map TV remote keys to gamepad input, show an overlay menu (save, load, swap disc, quit), and route
   back/exit to `save-and-exit`. A cross-origin iframe can't be scripted.
@@ -432,9 +435,10 @@ TV's own picture processing costs the same whether the game runs locally or stre
 
 **What Moonfin does to keep latency down**
 
-1. **Never put the plugin in the media path.** The plugin proxies only HTTP and signaling (section 7).
-   Video and input go container ⇄ client directly. On a LAN, ICE must find a direct candidate.
-   The TURN relay is for remote play only, and the stats overlay flags a relayed session.
+1. **Never put the plugin in the media path.** The plugin proxies only the page and signaling, and
+   media rides WebRTC (7b). Video and input go container ⇄ client directly, or through a TURN server
+   on the same home network. On a LAN, ICE must find a direct candidate. The stats overlay shows the
+   selected candidate type (host / srflx / relay) and where the relay is.
 2. **Minimal browser buffering.** The injected bridge script sets `jitterBufferTarget` (and the older
    `playoutDelayHint`) to the lowest value on the room's video and audio receivers, and turns off
    anything that smooths playback at the cost of delay. It falls back silently where the browser
@@ -482,6 +486,89 @@ them where it can. Nothing is forced.
 - **End-to-end test mode:** a built-in "latency test" that flashes a marker on button press inside
   the stream, for checking glass-to-glass with a phone's slow-motion camera. Use it to verify the
   budget above on each client class before claiming the targets in user docs.
+
+### 7b. Transport and remote access (keeping media off the proxy)
+
+**Selkies transports** (LinuxServer `baseimage-selkies`, which `lscr.io/linuxserver/webstation:romm`
+builds on):
+
+| `SELKIES_MODE` | Media path | Good for |
+|---|---|---|
+| `websockets` (**default**) | TCP, over the container's HTTP port (3000/3001) and anything proxying it | LAN only. On a lossy internet link, TCP head-of-line blocking turns packet loss into stalls. |
+| `webrtc` | UDP: direct, or via STUN/TURN | Everything, and required for remote play. It's turned on automatically when any `SELKIES_STUN_*`, `SELKIES_TURN_*` or `SELKIES_WEBRTC_PUBLIC_IP` variable is set, and then dual mode is on too. |
+
+Moonfin's setup guide and "Test connection" check that each streaming container is in WebRTC
+mode. If one isn't, it's flagged as "LAN only", and the plugin only offers it to clients on the
+local network.
+
+**Getting internet clients onto a direct (or local) media path**, in recommended order:
+
+1. **Self-hosted TURN on the home network (recommended default).** Run coturn next to the
+   streaming host, and forward only its ports on the router: `3478/udp`, optionally `5349/tcp`
+   (TLS for restrictive networks), and a small fixed relay range (e.g. `49160–49200/udp`). Configure
+   the container with `SELKIES_TURN_HOST/PORT/PROTOCOL` and `SELKIES_TURN_SHARED_SECRET`. The "relay" is then
+   on the same LAN as the emulator, so it adds well under a millisecond, unlike a distant cloud TURN.
+   It works for practically every client NAT, and the containers stay unexposed. The plugin shares the
+   coturn secret and mints **short-lived, per-session TURN credentials** (the standard TURN REST
+   scheme), so a leaked room URL isn't a free relay.
+2. **Direct UDP to the container** with `SELKIES_WEBRTC_PUBLIC_IP` and host or macvlan networking, so
+   Docker's userland proxy isn't in the UDP path. This is the shortest path, but the router must
+   forward the UDP ports WebRTC picks. Unless the Selkies version in use pins its port range, that
+   means a wide range, so prefer option 1. Check the LinuxServer WebRTC transport docs for the
+   current port behaviour before recommending it.
+3. **IPv6.** If the ISP delegates a prefix and the streaming host has a global address, there is no
+   NAT at all. Allow inbound UDP to that host in the router firewall. ICE prefers it automatically.
+4. **VPN** (the router's WireGuard server, or Tailscale) for Core devices away from home. Media
+   then rides the tunnel directly (WireGuard adds ~1 ms and a small MTU cost). Tailscale must
+   reach a direct connection, because its DERP relay fallback is far too slow for games. webOS/Tizen
+   TVs can't run a VPN client, so they use option 1.
+5. **No cloud TURN** (e.g. Cloudflare's, which Selkies supports) except as a last resort. It works
+   but adds the distance to the provider and back.
+
+**Plugin and client work for this**
+
+- `GET /Moonfin/Games/Streaming/Config` returns, per platform, the container's transport mode, and for
+  WebRTC the ICE servers to use (LAN TURN with per-session credentials). The bridge script passes
+  them to the room's peer connection if the page didn't get them from the container.
+- Clients report whether they're on the LAN (same subnet as the server, or the plugin's local-network
+  check, which Jellyfin already does for its own LAN/WAN bitrate limits). Remote clients
+  are only offered WebRTC-mode containers.
+- Bitrate follows the path: a lower cap for remote sessions, sized to the home's **upload** speed,
+  which is what limits a remote stream. The cap is set through Selkies' rate-control settings where
+  the container allows per-session changes, otherwise documented as a container setting.
+
+**Router guidance (documented in the admin guide; example: UniFi Dream Machine Pro)**
+
+Menu locations move between UniFi Network versions. The guide names the feature and describes
+where it lives in current releases.
+
+- **Port forwards:** only coturn's ports (option 1), pointed at the TURN host. Never forward the
+  Selkies HTTP ports. In UniFi's zone-based firewall, the matching allow rule is created with the forward.
+- **Smart Queues (SQM)** on the WAN: the single biggest router-side win. It stops other household
+  traffic (uploads, backups, someone else's video) from building queues that add tens to hundreds of
+  ms of jitter. Set it to ~90–95% of measured line speed, in both directions. Upload matters most
+  for remote players. Caveat: on the UDM Pro, Smart Queues is CPU-bound and caps throughput (roughly
+  in the high hundreds of Mbit/s), so enable it if the line is near or below that, or if bufferbloat
+  tests show a problem.
+- **Split DNS / NAT loopback:** add a local DNS record so LAN clients resolve the public hostname to
+  the server's LAN address, rather than hairpinning through the gateway's NAT.
+- **Keep streaming traffic on one network:** put the streaming host and the TVs on the same
+  VLAN/subnet where possible. Inter-VLAN traffic goes through the gateway's routing, firewall and
+  IDS/IPS path. If they must be separate, that's fine, but measure.
+- **IDS/IPS (Threat Management):** it inspects every packet, which adds a little latency and jitter
+  and cuts throughput. Test sessions with it on and off. If it measurably hurts, exclude the
+  streaming host's network or the TURN traffic where the controller allows it, rather than turning
+  it off globally.
+- **Wi-Fi:** wire the TVs and the streaming host where possible. Otherwise use 5 GHz or 6 GHz, an AP
+  with a wired uplink (wireless mesh uplinks add latency and halve airtime), and an 80 MHz channel
+  on a clear frequency. WebRTC marks its packets with DSCP, which UniFi APs map to Wi-Fi WMM
+  priority queues.
+- **Remote VPN:** the gateway's built-in WireGuard server for option 4.
+- **IPv6:** if the ISP delegates a prefix, enable it on the streaming network and add a firewall rule
+  allowing inbound UDP to the TURN host or streaming host only (option 3).
+- **Verify:** run a bufferbloat test (loaded latency) before and after Smart Queues. Then check the
+  stats overlay on a remote session: candidate type `relay` via the LAN TURN, or `srflx`/`host`,
+  with RTT close to the plain ping to the home connection.
 
 ### 8. Client work by app
 
@@ -554,10 +641,15 @@ Report unsupported features in the admin "Test connection" output rather than fa
 | 1 | Account association (device flow + admin mapping + auto-matching with one-tap approval), device registration, then RomM browse/metadata/artwork + ROM/BIOS proxy as the linked user, per-user game data (status, rating, last played, rows). | Every client except Roku can browse and play RomM games locally, each user seeing their own RomM data. |
 | 2 | States to RomM, SRAM sync in Core and Smart-TV, conflict UI, playtime ingest with offline queue. | Saves and playtime round-trip with RomM and other RomM clients. |
 | 3 | Play-mode decision + config-driven streaming endpoints + Core stream player (direct room URL, LAN). | Any platform RomM has a container for is playable on Core devices without downloading. |
-| 4 | Room reverse proxy + remote-key bridge + low-buffer hints + stats overlay and admin latency panel + Smart-TV stream player. Container tuning guide. | Streaming on webOS/Tizen, with the containers not exposed. Latency measured against the 7a targets. |
+| 4 | Room reverse proxy (page + signaling only) + WebRTC-mode check + LAN TURN with per-session credentials + remote-key bridge + low-buffer hints + stats overlay and admin latency panel + Smart-TV stream player. Container tuning and router/network guide (7b). | Streaming on webOS/Tizen, with the containers not exposed. Latency measured against the 7a targets. |
 | 5 | Native WebRTC stream player in Core (spike, then build if Selkies' protocol is stable enough). Fully automatic linking via the upstream RomM delegated-token feature, once merged (propose the PR alongside phase 1). Roku games UI (browse). LL-HLS spike. Multi-disc lazy download. Save migration task. | Rounds out coverage. |
 
 ## Risks and open questions
+
+- **Default transport carries media over HTTP:** Selkies' default WebSocket mode would put the
+  stream through any page proxy, the plugin's included. Moonfin's remote play requires WebRTC mode.
+  Detect each container's mode and label WebSocket-mode containers "LAN only" rather than letting
+  remote sessions silently run through the proxy.
 
 - **Latency is mostly outside Moonfin's control:** encoder, GPU and emulator settings belong to the
   RomM container. The 7a targets assume a GPU-encoding container on wired LAN, and must be validated
