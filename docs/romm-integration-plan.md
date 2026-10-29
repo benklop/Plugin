@@ -398,6 +398,91 @@ itself. Because they share RomM's save model, a PSX game saved on a streamed ses
 for local play elsewhere (subject to the core-compatibility caveat above, for SRAM vs memory card
 formats). That cross-mode continuity is the main payoff of syncing to RomM rather than to Moonbase.
 
+### 7a. Streaming latency
+
+The figures below are typical for WebRTC game streaming of this kind (Steam Link, Moonlight and
+browser WebRTC clients). They are **not yet measured on RomM's containers**. RomM itself sets no
+encoder options. Capture, encoder, frame rate and bitrate belong to the Selkies container image
+and its environment, which the RomM admin controls. Moonfin's job is to avoid adding latency,
+help admins tune the containers, and measure what users actually get.
+
+**Budget: delay added over local play, LAN, 60 fps**
+
+| Stage | Well tuned | Typical | Who controls it |
+|---|---|---|---|
+| Capture in the container | 1–5 ms | up to 1 frame (~17 ms) | Container image |
+| Encode | 2–5 ms (NVENC / QuickSync / VAAPI) | 8–20 ms (CPU x264) | Container image + host GPU |
+| Network | 1–3 ms wired | 5–15 ms Wi-Fi + jitter | User's network |
+| Browser jitter buffer | ~0–10 ms when forced low | 20–60 ms default | **Moonfin** (bridge script) |
+| Decode | 3–10 ms (PC, phone, Android TV) | 30–100 ms (webOS/Tizen browser) | Client device / **Moonfin** player choice |
+| Input back to the server | 1–5 ms | 5–15 ms | **Moonfin** input path |
+| **Total added** | **≈ 20–40 ms** | **≈ 60–150 ms** | |
+
+For context, many PSX-era games already have 50–100 ms of lag built in on real hardware, and the
+TV's own picture processing costs the same whether the game runs locally or streams.
+
+**Targets by client** (added latency, LAN, wired, GPU-encoding container)
+
+| Client | v1 target | Later target | Limiting factor |
+|---|---|---|---|
+| Core (WebView) on PC / Android TV / phone / Apple TV | ≤ 50 ms | ≤ 25 ms with a native player (below) | WebView video pipeline |
+| Smart-TV (webOS / Tizen) | ≤ 120 ms | ≤ 80 ms on newer models | Browser hardware decoder buffering |
+| Any client over the internet | the LAN figure + round trip (+ TURN hop if relayed) | | Distance, TURN |
+| Roku (LL-HLS spike) | 1–3 s, ~1 s floor | | Roku player segment buffering. Turn-based games only. |
+
+**What Moonfin does to keep latency down**
+
+1. **Never put the plugin in the media path.** The plugin proxies only HTTP and signaling (section 7).
+   Video and input go container ⇄ client directly. On a LAN, ICE must find a direct candidate.
+   The TURN relay is for remote play only, and the stats overlay flags a relayed session.
+2. **Minimal browser buffering.** The injected bridge script sets `jitterBufferTarget` (and the older
+   `playoutDelayHint`) to the lowest value on the room's video and audio receivers, and turns off
+   anything that smooths playback at the cost of delay. It falls back silently where the browser
+   lacks the API. Users can choose "Lowest latency" (default) or "Smoothest" if their network
+   stutters.
+3. **A fast input path.** The bridge reads gamepad and remote input from the frame's own events
+   and sends it on the existing data channel immediately, with no batching. TV remote-key mapping
+   happens in that same script, not through an extra hop to the plugin.
+4. **Native stream player in Core (later phase).** Replace the WebView for streaming with a native
+   WebRTC client (e.g. `flutter_webrtc` / libwebrtc) that uses low-latency decoder modes (Android
+   `MediaCodec` `KEY_LOW_LATENCY`, VideoToolbox real-time on Apple, hardware decode on desktop),
+   renders straight to a texture, and polls gamepads natively. This means speaking Selkies'
+   signaling and data-channel protocol directly, so it depends on that protocol being stable enough
+   to track. Spike it first, and keep the WebView player as the fallback.
+5. **Display hints.** On the first stream, prompt the user to enable the TV's Game Mode, and use
+   wired Ethernet or 5 GHz Wi-Fi. Where the platform exposes it, request a low-latency or game
+   display mode (ALLM) for the stream view.
+6. **Pause the stream when hidden.** Release the decoder when the app is backgrounded, so a resumed
+   session starts with an empty pipeline instead of draining stale frames.
+
+**Container recommendations (documented in the admin guide and shown by Test connection)**
+
+These are RomM/container settings, not Moonfin ones, so Moonfin documents them and checks for
+them where it can. Nothing is forced.
+
+- **GPU encoding** by passing a GPU through to the streaming container (NVENC, QuickSync or VAAPI).
+  This is the single biggest win over CPU x264.
+- **Run-ahead** in the container's emulator where supported (RetroArch cores, and the standalone
+  PSX emulators that offer it). One or two frames of run-ahead removes 17–33 ms of the game's
+  own internal lag, which can roughly offset what streaming adds. Recommend it for PSX-class and
+  older systems, where the host has CPU to spare, and not for heavy emulators (PS2/PS3/Wii U),
+  where it would cost frame rate.
+- **60 fps at a moderate resolution** (720p, or native resolution scaled 2–3×) rather than 4K.
+  Encode and decode time grow with pixel count, and TVs decode 1080p60 more reliably than higher.
+- **Low-latency encoder settings:** no B-frames, short GOP or intra refresh, and a CBR or capped
+  bitrate sized for the network (roughly 10–20 Mbit/s for 720p60 on LAN).
+
+**Measurement**
+
+- **Stats overlay** (toggle in the stream menu, always available in debug builds): round trip,
+  jitter-buffer delay, decode time per frame, frames dropped and decoded per second, current
+  bitrate, and direct vs relayed, all from WebRTC `getStats()`. A small summary (median and p95 of
+  each) is sent to the plugin at session end and shown per client in the admin "Streaming" panel,
+  so admins can see the effect of a container change.
+- **End-to-end test mode:** a built-in "latency test" that flashes a marker on button press inside
+  the stream, for checking glass-to-glass with a phone's slow-motion camera. Use it to verify the
+  budget above on each client class before claiming the targets in user docs.
+
 ### 8. Client work by app
 
 **Moonfin Core**
@@ -406,15 +491,16 @@ formats). That cross-mode continuity is the main payoff of syncing to RomM rathe
   handling.
 - Native player: SRAM sync, `.m3u` multi-disc with lazy per-disc download, and a resumable Range
   download into `GameStorage` (PSX images are hundreds of MB).
-- Stream player screen: WebView host, launch progress, overlay menu, heartbeat, lifecycle handling.
+- Stream player screen: WebView host, launch progress, overlay menu, heartbeat, lifecycle handling,
+  stats overlay. Later: a native WebRTC stream player (7a) with the WebView kept as fallback.
 - Settings: link RomM account (QR flow), play-mode preference, max download size.
 
 **Smart-TV**
 - `gamesApi.js`: the same additions. The proxy-for-text vs native-fetch-for-binary split already
   exists and covers SRAM.
 - `GamePlayer`: SRAM sync through EmulatorJS hooks.
-- New `GameStreamPlayer` view (iframe + remote-key bridge). Disable it via capability detection on TVs
-  without WebRTC.
+- New `GameStreamPlayer` view (iframe + remote-key bridge + low-buffer hints + stats overlay).
+  Disable it via capability detection on TVs without WebRTC.
 - Details screen: a play button that reflects the chosen mode ("Play" / "Stream").
 
 **Roku**
@@ -440,6 +526,8 @@ formats). That cross-mode continuity is the main payoff of syncing to RomM rathe
   that previews the matches before enabling.
 - Streaming: on/off, proxy the room (default on), TURN server info shown to clients, idle timeout.
   There's no per-platform streaming list here. That lives in RomM's container config.
+- Streaming quality: per-client latency summaries from recent sessions (median and p95 round trip,
+  buffer and decode time, direct vs relayed), with links to the container tuning recommendations in 7a.
 - Migration helper: for users who move a filesystem library to RomM, an optional task that matches
   Moonbase saves to RomM ROMs by hash and uploads them.
 
@@ -466,10 +554,17 @@ Report unsupported features in the admin "Test connection" output rather than fa
 | 1 | Account association (device flow + admin mapping + auto-matching with one-tap approval), device registration, then RomM browse/metadata/artwork + ROM/BIOS proxy as the linked user, per-user game data (status, rating, last played, rows). | Every client except Roku can browse and play RomM games locally, each user seeing their own RomM data. |
 | 2 | States to RomM, SRAM sync in Core and Smart-TV, conflict UI, playtime ingest with offline queue. | Saves and playtime round-trip with RomM and other RomM clients. |
 | 3 | Play-mode decision + config-driven streaming endpoints + Core stream player (direct room URL, LAN). | Any platform RomM has a container for is playable on Core devices without downloading. |
-| 4 | Room reverse proxy + remote-key bridge + Smart-TV stream player. | Streaming on webOS/Tizen, with the containers not exposed. |
-| 5 | Fully automatic linking via the upstream RomM delegated-token feature, once merged (propose the PR alongside phase 1). Roku games UI (browse). LL-HLS spike. Multi-disc lazy download. Save migration task. | Rounds out coverage. |
+| 4 | Room reverse proxy + remote-key bridge + low-buffer hints + stats overlay and admin latency panel + Smart-TV stream player. Container tuning guide. | Streaming on webOS/Tizen, with the containers not exposed. Latency measured against the 7a targets. |
+| 5 | Native WebRTC stream player in Core (spike, then build if Selkies' protocol is stable enough). Fully automatic linking via the upstream RomM delegated-token feature, once merged (propose the PR alongside phase 1). Roku games UI (browse). LL-HLS spike. Multi-disc lazy download. Save migration task. | Rounds out coverage. |
 
 ## Risks and open questions
+
+- **Latency is mostly outside Moonfin's control:** encoder, GPU and emulator settings belong to the
+  RomM container. The 7a targets assume a GPU-encoding container on wired LAN, and must be validated
+  with the latency test before being promised in user docs.
+- **Smart-TV decode buffering:** some webOS/Tizen models may buffer video in ways the browser APIs
+  can't override, which would leave those TVs above the 120 ms target. Keep a per-model allow-list
+  if testing shows a wide spread.
 
 - **Upstream dependency for zero-touch linking:** fully automatic linking needs the RomM
   delegated-token feature (2a, path A). Without it the best is one tap. Open the discussion with
