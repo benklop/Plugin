@@ -148,6 +148,8 @@ public class MoonfinController : ControllerBase
             IncompleteRecordingsSupported = config?.LiveTvDetectIncompleteRecordings ?? true,
             ExtendedCompleteShowingsSupported = config?.LiveTvDetectIncompleteRecordings ?? true,
             TimeSupported = true,
+            HouseholdSupported = true,
+            HouseholdSessionsSupported = HouseholdController.SessionsSupported,
             RecommendationsSupported = config?.RecommendationsProviderEnabled ?? true,
             DefaultSettings = config?.DefaultUserSettings
         });
@@ -1616,6 +1618,20 @@ public class MoonfinPingResponse
     /// </summary>
     [JsonPropertyName("timeSupported")]
     public bool? TimeSupported { get; set; }
+
+    /// <summary>
+    /// True when this plugin has the Moonfin/Household endpoints, through which a household's
+    /// managers look after its other accounts. Older plugins leave it out.
+    /// </summary>
+    [JsonPropertyName("householdSupported")]
+    public bool? HouseholdSupported { get; set; }
+
+    /// <summary>
+    /// True when Moonfin/Household/Sessions can add the household to a device, which needs
+    /// Jellyfin 12.0 or later. False on older servers; left out by older plugins.
+    /// </summary>
+    [JsonPropertyName("householdSessionsSupported")]
+    public bool? HouseholdSessionsSupported { get; set; }
 
     /// <summary>
     /// True when this plugin supports server-side recommendations scoring.

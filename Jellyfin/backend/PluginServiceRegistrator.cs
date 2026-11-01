@@ -25,6 +25,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddScoped<IEventConsumer<UserCreatedEventArgs>, DefaultHiddenLibrariesOnUserCreated>();
         serviceCollection.AddSingleton<IPinStore, FilePinStore>();
         serviceCollection.AddSingleton<PinService>(sp => new PinService(sp.GetRequiredService<IPinStore>()));
+        serviceCollection.AddSingleton<HouseholdService>(sp => new HouseholdService(sp.GetRequiredService<IUserDirectory>()));
         serviceCollection.AddSingleton<MoonfinThemeValidator>();
         serviceCollection.AddSingleton<MoonfinThemeStore>();
         serviceCollection.AddSingleton<SeerrSessionService>();

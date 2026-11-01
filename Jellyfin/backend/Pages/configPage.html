@@ -759,7 +759,7 @@
                         </button>
                         <button type="button" class="moonfinNavItem" data-tab="accounts">
                             <span class="material-icons moonfinNavIcon" aria-hidden="true">family_restroom</span>
-                            <span class="moonfinNavText"><span class="moonfinNavLabel">Accounts</span><span class="moonfinNavSub">Server PINs</span></span>
+                            <span class="moonfinNavText"><span class="moonfinNavLabel">Accounts</span><span class="moonfinNavSub">PINs, households</span></span>
                         </button>
                         <button type="button" class="moonfinNavItem" data-tab="actions">
                             <span class="material-icons moonfinNavIcon" aria-hidden="true">campaign</span>
@@ -3958,6 +3958,30 @@
                         <div id="AdminPinResult" class="fieldDescription" style="display:none; margin-top:0.8em;"></div>
                     </div>
 
+                    <div class="verticalSection">
+                        <h3 class="sectionTitle">Households</h3>
+                        <div class="fieldDescription" style="margin-bottom: 0.8em;">
+                            A household's managers can look after everyone in it, other managers included, without being
+                            administrators: add every account to their own device at once, approve a Quick Connect code
+                            for an account on another device, reset its PIN and set its access schedule. Administrators
+                            can't be in a household. A manager can sign in as a co-manager, so they also reach any other
+                            household that co-manager manages; the line under each household shows who each manager can
+                            reach. Apps that support it offer this to managers when they sign in.
+                        </div>
+                        <div id="HouseholdSessionsNote" class="fieldDescription" style="display:none; margin-bottom:0.8em; color:#ffb74d;">
+                            Adding every account to a device needs Jellyfin 12.0 or later. On this server managers can
+                            still approve Quick Connect codes, reset PINs and set schedules.
+                        </div>
+                        <div id="HouseholdList"></div>
+                        <button is="emby-button" type="button" class="raised" id="AddHouseholdButton" style="margin-right:0.6em;">
+                            <span>Add Household</span>
+                        </button>
+                        <button is="emby-button" type="button" class="raised button-submit" id="SaveHouseholdsButton">
+                            <span>Save Households</span>
+                        </button>
+                        <div id="HouseholdResult" class="fieldDescription" style="display:none; margin-top:0.8em;"></div>
+                    </div>
+
                     </section>
                     <section class="moonfinTabPanel" data-tab="actions">
                     <div class="verticalSection">
@@ -7107,6 +7131,172 @@
                 });
             }
 
+            function loadHouseholds() {
+                var list = document.querySelector('#HouseholdList');
+                if (!list) {
+                    return Promise.resolve();
+                }
+
+                var result = document.querySelector('#HouseholdResult');
+                var addBtn = document.querySelector('#AddHouseholdButton');
+                var saveBtn = document.querySelector('#SaveHouseholdsButton');
+                var state = { households: [], users: [], reach: {} };
+
+                function say(text, isError) {
+                    result.style.display = text ? '' : 'none';
+                    result.textContent = text || '';
+                    result.style.color = isError ? '#ff6b6b' : '';
+                }
+
+                function nameOf(id) {
+                    var user = state.users.filter(function(u) { return u.id === id; })[0];
+                    return user ? user.name : id;
+                }
+
+                // A checkbox per account that isn't an administrator
+                function picker(label, selected, onChange) {
+                    var wrap = document.createElement('div');
+                    wrap.style.margin = '0.4em 0 0.6em';
+                    var heading = document.createElement('div');
+                    heading.className = 'fieldDescription';
+                    heading.textContent = label;
+                    wrap.appendChild(heading);
+                    state.users.filter(function(u) { return !u.isAdministrator; }).forEach(function(user) {
+                        var item = document.createElement('label');
+                        item.style.display = 'inline-block';
+                        item.style.margin = '0.2em 1.2em 0.2em 0';
+                        var box = document.createElement('input');
+                        box.type = 'checkbox';
+                        box.checked = selected.indexOf(user.id) !== -1;
+                        box.style.marginRight = '0.3em';
+                        box.addEventListener('change', function() { onChange(user.id, box.checked); });
+                        item.appendChild(box);
+                        item.appendChild(document.createTextNode(user.name));
+                        wrap.appendChild(item);
+                    });
+                    return wrap;
+                }
+
+                function toggle(ids, id, on) {
+                    var at = ids.indexOf(id);
+                    if (on && at === -1) {
+                        ids.push(id);
+                    } else if (!on && at !== -1) {
+                        ids.splice(at, 1);
+                    }
+                }
+
+                function render() {
+                    list.innerHTML = '';
+                    if (!state.households.length) {
+                        var empty = document.createElement('div');
+                        empty.className = 'fieldDescription';
+                        empty.style.margin = '0 0 1em';
+                        empty.textContent = 'No households yet.';
+                        list.appendChild(empty);
+                    }
+
+                    state.households.forEach(function(household, index) {
+                        var card = document.createElement('div');
+                        card.style.cssText = 'margin:0 0 1.2em;padding:0.8em;border:1px solid rgba(255,255,255,0.1);border-radius:4px;';
+
+                        var name = document.createElement('input');
+                        name.type = 'text';
+                        name.maxLength = 80;
+                        name.placeholder = 'Household name';
+                        name.value = household.name || '';
+                        name.style.cssText = 'width:16em;margin-right:0.6em;';
+                        name.addEventListener('input', function() { household.name = name.value; });
+                        card.appendChild(name);
+
+                        var remove = document.createElement('button');
+                        remove.type = 'button';
+                        remove.setAttribute('is', 'emby-button');
+                        remove.className = 'raised';
+                        remove.textContent = 'Remove';
+                        remove.addEventListener('click', function() {
+                            state.households.splice(index, 1);
+                            render();
+                        });
+                        card.appendChild(remove);
+
+                        card.appendChild(picker('Managers', household.managerIds, function(id, on) {
+                            toggle(household.managerIds, id, on);
+                            if (on) {
+                                toggle(household.memberIds, id, false);
+                            }
+                            render();
+                        }));
+                        card.appendChild(picker('Members', household.memberIds, function(id, on) {
+                            toggle(household.memberIds, id, on);
+                            if (on) {
+                                toggle(household.managerIds, id, false);
+                            }
+                            render();
+                        }));
+
+                        // What each manager reached as of the last save; unsaved changes aren't reflected
+                        household.managerIds.forEach(function(id) {
+                            var reach = state.reach[id];
+                            if (!reach) {
+                                return;
+                            }
+                            var line = document.createElement('div');
+                            line.className = 'fieldDescription';
+                            line.textContent = nameOf(id) + ' can manage: ' + (reach.length ? reach.join(', ') : 'nobody yet');
+                            card.appendChild(line);
+                        });
+
+                        list.appendChild(card);
+                    });
+                }
+
+                function take(response) {
+                    state.households = (response.households || []).map(function(h) {
+                        return { id: h.id, name: h.name, managerIds: (h.managerIds || []).slice(), memberIds: (h.memberIds || []).slice() };
+                    });
+                    state.users = response.users || [];
+                    state.reach = response.reach || {};
+                    document.querySelector('#HouseholdSessionsNote').style.display = response.sessionsSupported ? 'none' : '';
+                    render();
+                }
+
+                addBtn.addEventListener('click', function() {
+                    state.households.push({ id: '', name: '', managerIds: [], memberIds: [] });
+                    render();
+                });
+
+                saveBtn.addEventListener('click', function() {
+                    saveBtn.disabled = true;
+                    ApiClient.ajax({
+                        type: 'PUT',
+                        url: ApiClient.getUrl('Moonfin/Admin/Households'),
+                        data: JSON.stringify({ households: state.households }),
+                        contentType: 'application/json',
+                        dataType: 'json'
+                    }).then(function(response) {
+                        take(response);
+                        var dropped = response.dropped || [];
+                        say(dropped.length ? 'Saved. Left out: ' + dropped.join(' ') : 'Saved the households.', dropped.length > 0);
+                    }, function() {
+                        say('Couldn\'t save the households.', true);
+                    }).then(function() {
+                        saveBtn.disabled = false;
+                    });
+                });
+
+                return ApiClient.ajax({
+                    type: 'GET',
+                    url: ApiClient.getUrl('Moonfin/Admin/Households'),
+                    dataType: 'json'
+                }).then(function(response) {
+                    take(response);
+                    say('', false);
+                }, function() {
+                    say('Couldn\'t load the households.', true);
+                });
+            }
+
             function resetMessageForm() {
                 moonfinEditingMessageId = null;
 
@@ -7749,6 +7939,7 @@
                     loadMessagesList();
                 });
                 loadAdminPins();
+                loadHouseholds();
 
                 loadConfigBackupStatus();
 
@@ -9062,10 +9253,11 @@
                         config.DefaultUserSettings.hiddenOsdButtonsMobile = osdVal.hidden;
                         config.DefaultUserSettings.hiddenOsdButtonsDesktop = osdVal.hidden;
 
-                        // Messages live in this object but are managed through their own
-                        // endpoints, so the copy read at the top of submit() is already stale.
+                        // Messages and Households live in this object but are managed through their
+                        // own endpoints, so the copy read at the top of submit() is already stale.
                         return ApiClient.getPluginConfiguration(MoonfinConfig.pluginUniqueId).then(function(fresh) {
                             config.Messages = fresh ? fresh.Messages : config.Messages;
+                            config.Households = fresh ? fresh.Households : config.Households;
                             return config;
                         }, function() {
                             // Dropping the key would be worse: the server replaces the whole

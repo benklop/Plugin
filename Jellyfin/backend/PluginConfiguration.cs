@@ -341,6 +341,12 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </summary>
     public List<ServerMessage> Messages { get; set; } = new();
 
+    /// <summary>
+    /// Households whose managers can look after the other accounts in them. Saved through
+    /// Moonfin/Admin/Households, which leaves administrators out, rather than the settings form.
+    /// </summary>
+    public List<Moonfin.Households.Household> Households { get; set; } = new();
+
     // ---------------------------------------------------------------------
     // Retro games (EmulatorJS) configuration
     // ---------------------------------------------------------------------
