@@ -4033,6 +4033,160 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-checkbox', 'em
             });
     }
 
+    function loadHouseholds(view) {
+        var list = view.querySelector('#HouseholdList');
+        if (!list) return;
+
+        var result = view.querySelector('#HouseholdResult');
+        var addBtn = view.querySelector('#AddHouseholdButton');
+        var saveBtn = view.querySelector('#SaveHouseholdsButton');
+        var serverUrl = ApiClient.serverAddress ? ApiClient.serverAddress() : '';
+        // Kept on the list so the buttons, bound once, always see the latest state
+        var state = list.moonfinHouseholds || (list.moonfinHouseholds = { households: [], users: [], reach: {} });
+
+        function say(text, isError) {
+            result.style.display = text ? '' : 'none';
+            result.textContent = text || '';
+            result.style.color = isError ? '#d9534f' : '';
+        }
+
+        function nameOf(id) {
+            var user = state.users.filter(function (u) { return u.id === id; })[0];
+            return user ? user.name : id;
+        }
+
+        function toggle(ids, id, on) {
+            var at = ids.indexOf(id);
+            if (on && at === -1) ids.push(id);
+            else if (!on && at !== -1) ids.splice(at, 1);
+        }
+
+        // A checkbox per account that isn't an administrator
+        function picker(label, selected, onChange) {
+            var wrap = document.createElement('div');
+            wrap.style.margin = '0.4em 0 0.6em';
+            var heading = document.createElement('div');
+            heading.className = 'fieldDescription';
+            heading.textContent = label;
+            wrap.appendChild(heading);
+            state.users.filter(function (u) { return !u.isAdministrator; }).forEach(function (user) {
+                var item = document.createElement('label');
+                item.style.display = 'inline-block';
+                item.style.margin = '0.2em 1.2em 0.2em 0';
+                var box = document.createElement('input');
+                box.type = 'checkbox';
+                box.checked = selected.indexOf(user.id) !== -1;
+                box.style.marginRight = '0.3em';
+                box.addEventListener('change', function () { onChange(user.id, box.checked); });
+                item.appendChild(box);
+                item.appendChild(document.createTextNode(user.name));
+                wrap.appendChild(item);
+            });
+            return wrap;
+        }
+
+        function render() {
+            list.innerHTML = '';
+            if (!state.households.length) {
+                var empty = document.createElement('div');
+                empty.className = 'fieldDescription';
+                empty.style.margin = '0 0 1em';
+                empty.textContent = 'No households yet.';
+                list.appendChild(empty);
+            }
+
+            state.households.forEach(function (household, index) {
+                var card = document.createElement('div');
+                card.style.cssText = 'margin:0 0 1.2em;padding:0.8em;border:1px solid rgba(128,128,128,0.3);border-radius:4px;';
+
+                var name = document.createElement('input');
+                name.type = 'text';
+                name.maxLength = 80;
+                name.placeholder = 'Household name';
+                name.value = household.name || '';
+                name.style.cssText = 'width:16em;margin-right:0.6em;';
+                name.addEventListener('input', function () { household.name = name.value; });
+                card.appendChild(name);
+
+                var remove = document.createElement('button');
+                remove.type = 'button';
+                remove.setAttribute('is', 'emby-button');
+                remove.className = 'raised';
+                remove.textContent = 'Remove';
+                remove.addEventListener('click', function () {
+                    state.households.splice(index, 1);
+                    render();
+                });
+                card.appendChild(remove);
+
+                card.appendChild(picker('Managers', household.managerIds, function (id, on) {
+                    toggle(household.managerIds, id, on);
+                    if (on) toggle(household.memberIds, id, false);
+                    render();
+                }));
+                card.appendChild(picker('Members', household.memberIds, function (id, on) {
+                    toggle(household.memberIds, id, on);
+                    if (on) toggle(household.managerIds, id, false);
+                    render();
+                }));
+
+                // What each manager reached as of the last save; unsaved changes aren't reflected
+                household.managerIds.forEach(function (id) {
+                    var reach = state.reach[id];
+                    if (!reach) return;
+                    var line = document.createElement('div');
+                    line.className = 'fieldDescription';
+                    line.textContent = nameOf(id) + ' can manage: ' + (reach.length ? reach.join(', ') : 'nobody yet');
+                    card.appendChild(line);
+                });
+
+                list.appendChild(card);
+            });
+        }
+
+        function take(response) {
+            state.households = (response.households || []).map(function (h) {
+                return { id: h.id, name: h.name, managerIds: (h.managerIds || []).slice(), memberIds: (h.memberIds || []).slice() };
+            });
+            state.users = response.users || [];
+            state.reach = response.reach || {};
+            render();
+        }
+
+        if (!list.moonfinBound) {
+            list.moonfinBound = true;
+            addBtn.addEventListener('click', function () {
+                state.households.push({ id: '', name: '', managerIds: [], memberIds: [] });
+                render();
+            });
+            saveBtn.addEventListener('click', function () {
+                saveBtn.disabled = true;
+                fetch(serverUrl + '/Moonfin/Admin/Households', {
+                    method: 'PUT',
+                    headers: moonfinAuthHeaders(),
+                    body: JSON.stringify({ households: state.households })
+                }).then(parseJsonResponse).then(function (response) {
+                    take(response);
+                    var dropped = response.dropped || [];
+                    say(dropped.length ? 'Saved. Left out: ' + dropped.join(' ') : 'Saved the households.', dropped.length > 0);
+                }, function () {
+                    say('Couldn\'t save the households.', true);
+                }).then(function () {
+                    saveBtn.disabled = false;
+                });
+            });
+        }
+
+        fetch(serverUrl + '/Moonfin/Admin/Households', { method: 'GET', headers: moonfinAuthHeaders() })
+            .then(parseJsonResponse)
+            .then(function (response) {
+                take(response);
+                say('', false);
+            }, function () {
+                say('Couldn\'t load the households.', true);
+            });
+    }
+
     function loadAdminPins(view) {
         var list = view.querySelector('#AdminPinList');
         if (!list) return;
@@ -4440,6 +4594,7 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-checkbox', 'em
             loadMessagesList(view);
         });
         loadAdminPins(view);
+        loadHouseholds(view);
         loadConfig(view);
     };
 

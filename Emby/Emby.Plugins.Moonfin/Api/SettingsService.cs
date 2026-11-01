@@ -92,6 +92,10 @@ namespace Emby.Plugins.Moonfin.Api
                 // messages button.
                 messagesSupported = true,
                 pinSupported = true,
+                // Older plugins leave these out. Emby has no Quick Connect, so the household
+                // endpoints answer that one with unsupported_server.
+                householdSupported = true,
+                householdSessionsSupported = true,
                 incompleteRecordingsSupported = config?.LiveTvDetectIncompleteRecordings ?? true,
                 extendedCompleteShowingsSupported = config?.LiveTvDetectIncompleteRecordings ?? true,
                 clientLogSupported = config?.EnableClientLogUpload ?? false,

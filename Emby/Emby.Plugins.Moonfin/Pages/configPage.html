@@ -972,7 +972,7 @@
                         </button>
                         <button type="button" class="moonfinNavItem" data-tab="accounts">
                             <svg class="moonfinNavIcon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-                            <span class="moonfinNavText"><span class="moonfinNavLabel">Accounts</span><span class="moonfinNavSub">Server PINs</span></span>
+                            <span class="moonfinNavText"><span class="moonfinNavLabel">Accounts</span><span class="moonfinNavSub">PINs, households</span></span>
                         </button>
                         <button type="button" class="moonfinNavItem" data-tab="actions">
                             <svg class="moonfinNavIcon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 11v2h4v-2h-4zm-2 6.61c.96.71 2.21 1.65 3.2 2.39.4-.53.8-1.07 1.2-1.6-.99-.74-2.24-1.68-3.2-2.4-.4.54-.8 1.08-1.2 1.61zM20.4 5.6c-.4-.53-.8-1.07-1.2-1.6-.99.74-2.24 1.68-3.2 2.4.4.53.8 1.07 1.2 1.6.96-.72 2.21-1.65 3.2-2.4zM4 9c-1.1 0-2 .9-2 2v2c0 1.1.9 2 2 2h1v4h2v-4h1l5 3V6L8 9H4zm11.5 3c0-1.33-.58-2.53-1.5-3.35v6.69c.92-.81 1.5-2.01 1.5-3.34z"/></svg>
@@ -4124,6 +4124,26 @@
                         </div>
                         <div id="AdminPinList"></div>
                         <div id="AdminPinResult" class="fieldDescription" style="display:none; margin-top:0.8em;"></div>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h3 class="sectionTitle">Households</h3>
+                        <div class="fieldDescription" style="margin-bottom: 0.8em;">
+                            A household's managers can look after everyone in it, other managers included, without being
+                            administrators: add every account to their own device at once, reset its PIN and set its
+                            access schedule. Administrators can't be in a household. A manager can sign in as a
+                            co-manager, so they also reach any other household that co-manager manages; the line under
+                            each household shows who each manager can reach. Apps that support it offer this to managers
+                            when they sign in.
+                        </div>
+                        <div id="HouseholdList"></div>
+                        <button is="emby-button" type="button" class="raised" id="AddHouseholdButton" style="margin-right:0.6em;">
+                            <span>Add Household</span>
+                        </button>
+                        <button is="emby-button" type="button" class="raised button-submit" id="SaveHouseholdsButton">
+                            <span>Save Households</span>
+                        </button>
+                        <div id="HouseholdResult" class="fieldDescription" style="display:none; margin-top:0.8em;"></div>
                     </div>
 
                     </section>

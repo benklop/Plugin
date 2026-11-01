@@ -205,6 +205,12 @@ namespace Emby.Plugins.Moonfin
         /// </summary>
         public List<ServerMessage> Messages { get; set; } = new List<ServerMessage>();
 
+        /// <summary>
+        /// Households whose managers can look after the other accounts in them. Saved through
+        /// Moonfin/Admin/Households, which leaves administrators out, rather than the settings form.
+        /// </summary>
+        public List<global::Moonfin.Households.Household> Households { get; set; } = new List<global::Moonfin.Households.Household>();
+
         // Retro games (EmulatorJS) configuration.
         public bool GamesEnabled { get; set; } = false;
         public List<string> GameLibraryIds { get; set; } = new List<string>();
