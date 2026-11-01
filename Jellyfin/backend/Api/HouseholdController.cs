@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using MediaBrowser.Common.Extensions;
 using MediaBrowser.Common.Net;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.QuickConnect;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Dto;
@@ -106,7 +107,6 @@ public class HouseholdController : ControllerBase
             .ToList();
 
         var deviceId = this.GetDeviceIdFromClaims();
-        var sessions = deviceId == null ? new List<SessionInfo>() : _sessions.Sessions.Where(s => s.DeviceId == deviceId).ToList();
         foreach (var user in manageable)
         {
             var dto = PolicyReflection.GetUserDto(HttpContext.RequestServices, user.Id);
@@ -120,7 +120,7 @@ public class HouseholdController : ControllerBase
                 HasPin = _pins.HasPin(user.Id),
                 IsDisabled = dto?.Policy?.IsDisabled == true,
                 EnableRemoteAccess = dto?.Policy?.EnableRemoteAccess != false,
-                SignedInOnThisDevice = sessions.Any(s => s.UserId == user.Id),
+                SignedInOnThisDevice = deviceId != null && DeviceReflection.ExistingToken(HttpContext.RequestServices, user.Id, deviceId) != null,
                 AccessSchedules = entries.Select(ScheduleDto.From).ToList(),
             };
             ApplyScheduleStatus(member, entries);
@@ -134,7 +134,9 @@ public class HouseholdController : ControllerBase
     /// Signs the household in on the caller's own device, so the app can keep a token for each
     /// account and switch between them. The device is the one the caller's token belongs to, never
     /// one named in the request. Each account gets its own result, so one that can't be signed in
-    /// (disabled, not allowed on this device, at its session limit) doesn't stop the others.
+    /// (disabled, not allowed on this device, at its session limit) doesn't stop the others. An
+    /// account that already has a sign-in on the device gets that one back, so running setup again
+    /// changes nothing.
     /// </summary>
     [HttpPost("Household/Sessions")]
     [Authorize]
@@ -227,6 +229,25 @@ public class HouseholdController : ControllerBase
             if (remote && !dto.Policy.EnableRemoteAccess)
             {
                 Fail(result, "remote_not_allowed", "This account can only be used at home");
+                continue;
+            }
+
+            // Hand back a sign-in the account already has on this device. Minting a new one makes
+            // Jellyfin log the old one out, which ends every account's live session on the device
+            // (SessionManager.Logout ends sessions by device id), so a repeated setup would knock
+            // the rest of the household off it.
+            var existing = DeviceReflection.ExistingToken(HttpContext.RequestServices, id, device.Value.DeviceId);
+            if (existing != null)
+            {
+                result.Success = true;
+                result.Reused = true;
+                result.AccessToken = existing;
+                result.ServerId = (HttpContext.RequestServices.GetService(typeof(IServerApplicationHost)) as IServerApplicationHost)?.SystemId;
+                result.User = dto;
+                ApplyScheduleStatus(result, PolicyReflection.ReadSchedules(dto.Policy));
+                _logger.LogInformation(
+                    "Household manager {Manager} reused {Target}'s sign-in on device {Device}",
+                    caller.Value.ToString("N"), target.Name, device.Value.DeviceName);
                 continue;
             }
 
@@ -762,7 +783,7 @@ public class HouseholdUser : IScheduleStatus
     [JsonPropertyName("enableRemoteAccess")]
     public bool EnableRemoteAccess { get; set; }
 
-    /// <summary>Whether the account has a live session on the device asking.</summary>
+    /// <summary>Whether the account already has a sign-in (an access token) on the device asking.</summary>
     [JsonPropertyName("signedInOnThisDevice")]
     public bool SignedInOnThisDevice { get; set; }
 
@@ -804,6 +825,10 @@ public class HouseholdSessionResult : IScheduleStatus
 
     [JsonPropertyName("success")]
     public bool Success { get; set; }
+
+    /// <summary>True when the account already had a sign-in on this device and it was handed back.</summary>
+    [JsonPropertyName("reused")]
+    public bool Reused { get; set; }
 
     [JsonPropertyName("accessToken")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
