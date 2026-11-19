@@ -42,6 +42,59 @@ public class RommClientTests
     }
 
     [Fact]
+    public async Task ARefreshOnlyAsksForChangesAndDropsWhatRommNoLongerHas()
+    {
+        var platforms = """[ { "id": 10, "slug": "snes", "fs_slug": "snes", "display_name": "SNES", "firmware": [] } ]""";
+        var handler = new RecordingHandler(request =>
+        {
+            var path = request.RequestUri!.PathAndQuery;
+            if (path == "/api/platforms")
+            {
+                return Json(platforms);
+            }
+
+            if (path == "/api/roms/identifiers")
+            {
+                // Game 1 was deleted. RomM still has 3, but its file is gone.
+                return Json("[2, 3, 4, 900]");
+            }
+
+            return Json(path.Contains("updated_after=")
+                ? "{ \"items\": [" + Rom(2, "2026-11-02T08:00:00+00:00", "Renamed") + "," + Rom(3, "2026-11-02T08:00:00+00:00", missing: true) + "," + Rom(4, "2026-11-02T09:30:00+00:00") + "] }"
+                : "{ \"items\": [" + Rom(1, "2026-11-01T10:00:00+00:00") + "," + Rom(2, "2026-11-01T10:00:00+00:00") + "," + Rom(3, "2026-11-01T09:00:00+00:00") + "] }");
+        });
+        var client = Client(handler);
+
+        var first = await client.LoadAsync(RommTestRules.Rules, CancellationToken.None);
+        var listing = handler.Requests[1].Url;
+        handler.Requests.Clear();
+        var second = await client.LoadAsync(RommTestRules.Rules, first, CancellationToken.None);
+
+        Assert.Contains("with_rom_id_index=false", listing);
+        Assert.Contains("with_filter_values=false", listing);
+        Assert.Equal(new[] { 1, 2, 3 }, first.Games.Select(game => game.Id));
+        Assert.Equal(new DateTimeOffset(2026, 11, 1, 10, 0, 0, TimeSpan.Zero), first.ChangedUpTo);
+
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Contains("updated_after=2026-11-01T09%3A50%3A00Z", handler.Requests[1].Url);
+        Assert.DoesNotContain("platform_ids=", handler.Requests[1].Url);
+        Assert.EndsWith("/api/roms/identifiers", handler.Requests[2].Url);
+        Assert.Equal(new[] { 2, 4 }, second.Games.Select(game => game.Id));
+        Assert.Equal("Renamed", second.FindGame(2)!.Title);
+        Assert.Equal(new DateTimeOffset(2026, 11, 2, 9, 30, 0, TimeSpan.Zero), second.ChangedUpTo);
+        Assert.Equal(first.FullLoadUtc, second.FullLoadUtc);
+
+        // A platform that came or went lists the whole library again.
+        platforms = """[ { "id": 10, "slug": "snes", "fs_slug": "snes", "display_name": "SNES", "firmware": [] }, { "id": 11, "slug": "gba", "fs_slug": "gba", "display_name": "GBA", "firmware": [] } ]""";
+        handler.Requests.Clear();
+        var third = await client.LoadAsync(RommTestRules.Rules, second, CancellationToken.None);
+
+        Assert.Contains("platform_ids=11", handler.Requests[1].Url);
+        Assert.DoesNotContain("updated_after=", handler.Requests[1].Url);
+        Assert.Equal(new[] { 1, 2, 3 }, third.Games.Select(game => game.Id));
+    }
+
+    [Fact]
     public async Task AskForTheRomFileItselfAndPassesTheRangeOn()
     {
         var handler = new RecordingHandler(_ => new HttpResponseMessage(HttpStatusCode.PartialContent));
@@ -158,6 +211,9 @@ public class RommClientTests
         Assert.Equal(expected, RommClient.AssetUrl(BaseUrl, path));
 
     private static RommClient Client(HttpMessageHandler handler) => new(new HttpClient(handler), BaseUrl, Token);
+
+    private static string Rom(int id, string updatedAt, string? name = null, bool missing = false) =>
+        $$"""{ "id": {{id}}, "platform_id": 10, "name": "{{name ?? "Game " + id}}", "updated_at": "{{updatedAt}}", "missing_from_fs": {{(missing ? "true" : "false")}}, "files": [ { "id": {{id}}, "file_name": "g{{id}}.sfc", "file_size_bytes": 1 } ] }""";
 
     private static HttpResponseMessage Json(string json) =>
         new(HttpStatusCode.OK) { Content = new StringContent(json, Encoding.UTF8, "application/json") };

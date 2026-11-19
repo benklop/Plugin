@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -23,6 +24,22 @@ public sealed class RommClient
 
     // Guards a runaway listing, far past any real library.
     private const int MaxPages = 2000;
+
+    // Turns off the gallery extras RomM otherwise works out over the whole library for every
+    // page (letter index, filter values, id index, count), and from RomM 5.5 the raw provider
+    // metadata Moonfin never reads, close to half of each game. Older RomMs ignore what they lack.
+    private const string ListingOnly = "with_char_index=false&with_filter_values=false&with_rom_id_index=false&with_total=false&with_provider_metadata=false";
+
+    // RomM stamps changes to the second and a slow write can land a little behind its stamp,
+    // so each refresh asks again for a margin before the newest change it has seen.
+    private static readonly TimeSpan ChangeOverlap = TimeSpan.FromMinutes(10);
+
+    // Refreshes only fetch changes. A full listing now and then catches anything that changed
+    // without RomM touching the game's own stamp.
+    private static readonly TimeSpan FullListingAge = TimeSpan.FromHours(12);
+
+    // One request, body included. The HttpClient's own timeout stops at the headers.
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromMinutes(2);
 
     private static readonly Regex ByteRange = new Regex(@"^bytes=[0-9]*-[0-9]*(,\s*[0-9]*-[0-9]*)*$", RegexOptions.Compiled);
 
@@ -61,9 +78,15 @@ public sealed class RommClient
         return string.IsNullOrEmpty(trimmed) || trimmed!.Any(char.IsWhiteSpace) ? null : trimmed;
     }
 
-    public async Task<RommSnapshot> LoadAsync(RommFileRules rules, CancellationToken cancellationToken)
+    public Task<RommSnapshot> LoadAsync(RommFileRules rules, CancellationToken cancellationToken) =>
+        LoadAsync(rules, null, cancellationToken);
+
+    /// <summary>
+    /// Lists the library. Given the last snapshot this only asks RomM for the games changed since
+    /// and for the ids it still has, so a refresh of a large library costs a few small requests.
+    /// </summary>
+    public async Task<RommSnapshot> LoadAsync(RommFileRules rules, RommSnapshot? previous, CancellationToken cancellationToken)
     {
-        // shortcut: each refresh lists the whole library again (about 5 KB a game), switch to updated_after deltas if large libraries make refreshes slow.
         List<RommPlatform> platforms;
         using (var document = await GetJsonAsync("/api/platforms", cancellationToken).ConfigureAwait(false))
         {
@@ -71,33 +94,146 @@ public sealed class RommClient
         }
 
         var byId = platforms.ToDictionary(platform => platform.Id);
-        var games = new List<RommGame>();
+        var now = DateTime.UtcNow;
         if (byId.Count == 0)
         {
-            return new RommSnapshot(platforms, games, DateTime.UtcNow);
+            return new RommSnapshot(platforms, new List<RommGame>(), now);
         }
 
-        var platformFilter = string.Join("&", byId.Keys.Select(id => "platform_ids=" + id));
+        // A platform that came or went changes which games are playable at all, so it takes a full listing.
+        if (previous?.ChangedUpTo != null && now - previous.FullLoadUtc < FullListingAge &&
+            previous.Platforms.Select(PlatformKey).SequenceEqual(platforms.Select(PlatformKey)))
+        {
+            try
+            {
+                return await LoadChangesAsync(rules, previous, platforms, byId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (RommRequestException ex) when (ex.StatusCode == 404 || ex.StatusCode == 422)
+            {
+                // A RomM without change filtering or the id list. Fall through to a full listing.
+            }
+        }
+
+        var games = new List<RommGame>();
+        var newest = await ListRomsAsync(
+            string.Join("&", byId.Keys.Select(id => "platform_ids=" + id)),
+            byId,
+            rules,
+            (_, game) =>
+            {
+                if (game != null)
+                {
+                    games.Add(game);
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+        return new RommSnapshot(platforms, games, now, newest, now);
+    }
+
+    /// <summary>Every ROM id the token's user can see in RomM, on any platform.</summary>
+    public async Task<HashSet<int>> RomIdsAsync(CancellationToken cancellationToken)
+    {
+        using var document = await GetJsonAsync("/api/roms/identifiers", cancellationToken).ConfigureAwait(false);
+        var ids = new HashSet<int>();
+        if (document.RootElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var id in document.RootElement.EnumerateArray())
+            {
+                if (id.TryGetInt32(out var value))
+                {
+                    ids.Add(value);
+                }
+            }
+        }
+
+        return ids;
+    }
+
+    private async Task<RommSnapshot> LoadChangesAsync(
+        RommFileRules rules,
+        RommSnapshot previous,
+        List<RommPlatform> platforms,
+        Dictionary<int, RommPlatform> byId,
+        CancellationToken cancellationToken)
+    {
+        var games = previous.Games.ToDictionary(game => game.Id);
+        var since = previous.ChangedUpTo!.Value.UtcDateTime - ChangeOverlap;
+
+        // No platform filter here, so a game that moved to a platform Moonfin can't play is seen and dropped.
+        var newest = await ListRomsAsync(
+            "updated_after=" + Uri.EscapeDataString(since.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture)),
+            byId,
+            rules,
+            (id, game) =>
+            {
+                if (game == null)
+                {
+                    games.Remove(id);
+                }
+                else
+                {
+                    games[id] = game;
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        // A deleted game never shows up as a change, so whatever RomM no longer lists goes.
+        var present = await RomIdsAsync(cancellationToken).ConfigureAwait(false);
+        var merged = games.Values.Where(game => present.Contains(game.Id)).OrderBy(game => game.Id).ToList();
+        var changedUpTo = newest == null || newest < previous.ChangedUpTo ? previous.ChangedUpTo : newest;
+        return new RommSnapshot(platforms, merged, DateTime.UtcNow, changedUpTo, previous.FullLoadUtc);
+    }
+
+    /// <summary>
+    /// Pages through /api/roms with a filter, handing each ROM's id and the game it makes (null
+    /// when Moonfin can't play it) to <paramref name="add"/>. Returns the newest change seen.
+    /// </summary>
+    private async Task<DateTimeOffset?> ListRomsAsync(
+        string filter,
+        IReadOnlyDictionary<int, RommPlatform> byId,
+        RommFileRules rules,
+        Action<int, RommGame?> add,
+        CancellationToken cancellationToken)
+    {
+        DateTimeOffset? newest = null;
         for (var page = 0; page < MaxPages; page++)
         {
             var offset = page * PageSize;
             using var document = await GetJsonAsync(
-                $"/api/roms?with_files=true&order_by=id&order_dir=asc&limit={PageSize}&offset={offset}&{platformFilter}",
+                $"/api/roms?with_files=true&order_by=id&order_dir=asc&limit={PageSize}&offset={offset}&{ListingOnly}&{filter}",
                 cancellationToken).ConfigureAwait(false);
             if (!document.RootElement.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
             {
                 break;
             }
 
-            games.AddRange(RommParser.ParseRoms(items, byId, rules));
+            foreach (var rom in items.EnumerateArray())
+            {
+                var id = RommParser.Int(rom, "id");
+                if (id == null)
+                {
+                    continue;
+                }
+
+                if (DateTimeOffset.TryParse(RommParser.Text(rom, "updated_at"), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var updated) &&
+                    (newest == null || updated > newest))
+                {
+                    newest = updated;
+                }
+
+                add(id.Value, RommParser.ParseRom(rom, byId, rules));
+            }
+
             if (items.GetArrayLength() < PageSize)
             {
                 break;
             }
         }
 
-        return new RommSnapshot(platforms, games, DateTime.UtcNow);
+        return newest;
     }
+
+    private static string PlatformKey(RommPlatform platform) => platform.Id + ":" + platform.Core;
 
     /// <summary>
     /// Checks the address and token the way the admin page needs: the server's version from the
@@ -351,16 +487,18 @@ public sealed class RommClient
 
     private async Task<JsonDocument> GetJsonAsync(string pathAndQuery, CancellationToken cancellationToken, bool authorize = true)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(RequestTimeout);
         using var request = NewRequest(HttpMethod.Get, pathAndQuery, authorize);
         request.Headers.Accept.ParseAdd("application/json");
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
             throw new RommRequestException((int)response.StatusCode, pathAndQuery);
         }
 
         using var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
-        return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return await JsonDocument.ParseAsync(stream, cancellationToken: timeout.Token).ConfigureAwait(false);
     }
 
     private HttpRequestMessage NewRequest(HttpMethod method, string pathAndQuery, bool authorize)

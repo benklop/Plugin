@@ -52,8 +52,25 @@ public sealed class RommAccountTests : IDisposable
         var reloaded = Source();
         Assert.Equal("rmm_user", reloaded.Accounts!.TokenFor(User));
         reloaded.ForUser(User).Snapshot();
-        Assert.Equal("Bearer rmm_user", _romm.LastListingAuthorization);
+        Assert.Equal("Bearer rmm_user", _romm.IdsAuthorization);
         Assert.Same(reloaded, reloaded.ForUser(Guid.NewGuid()));
+    }
+
+    [Fact]
+    public async Task ALinkedUserSeesTheSharedLibraryCutToWhatRommShowsThem()
+    {
+        var source = Source();
+        await Link(source.Accounts!);
+        _romm.UserSees = new[] { 12 };
+
+        var everyone = source.Snapshot()!;
+        var mine = source.ForUser(User).Snapshot()!;
+
+        Assert.Equal(new[] { 12, 13 }, everyone.Games.Select(game => game.Id));
+        Assert.Equal(12, Assert.Single(mine.Games).Id);
+        Assert.Null(source.ForUser(User).FindGame("romm-13"));
+        Assert.Equal(1, _romm.Listings);
+        Assert.Equal("Bearer rmm_admin", _romm.LastListingAuthorization);
     }
 
     [Fact]
@@ -233,6 +250,13 @@ public sealed class RommAccountTests : IDisposable
 
         public string? LastListingAuthorization { get; private set; }
 
+        public string? IdsAuthorization { get; private set; }
+
+        public int Listings { get; private set; }
+
+        /// <summary>The ROM ids RomM shows the linked user, the way its hidden ROMs and platforms leave them.</summary>
+        public int[] UserSees { get; set; } = { 12, 13 };
+
         public List<FakeAsset> Saves { get; } = new();
 
         public List<FakeAsset> States { get; } = new();
@@ -264,7 +288,17 @@ public sealed class RommAccountTests : IDisposable
                     LastListingAuthorization = request.Headers.Authorization?.ToString();
                     return Json("""[ { "id": 10, "slug": "snes", "fs_slug": "snes", "display_name": "SNES", "firmware": [] } ]""");
                 case "/api/roms":
-                    return Json("""{ "items": [ { "id": 12, "platform_id": 10, "name": "Super Mario World", "files": [ { "id": 15, "file_name": "Super Mario World (USA).sfc", "file_size_bytes": 9 } ] } ] }""");
+                    Listings++;
+                    return Json("""
+                        { "items": [
+                          { "id": 12, "platform_id": 10, "name": "Super Mario World", "files": [ { "id": 15, "file_name": "Super Mario World (USA).sfc", "file_size_bytes": 9 } ] },
+                          { "id": 13, "platform_id": 10, "name": "F-Zero", "files": [ { "id": 16, "file_name": "F-Zero (USA).sfc", "file_size_bytes": 9 } ] }
+                        ] }
+                        """);
+                case "/api/roms/identifiers":
+                    var auth = request.Headers.Authorization?.ToString();
+                    IdsAuthorization = auth;
+                    return Json(auth == "Bearer rmm_user" ? "[" + string.Join(",", UserSees) + "]" : "[12, 13]");
                 case "/api/saves":
                     return request.Method == HttpMethod.Post
                         ? await Upload(request, Saves, query)

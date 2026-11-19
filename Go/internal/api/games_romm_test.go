@@ -288,3 +288,58 @@ func TestRommAddressesAndArt(t *testing.T) {
 		}
 	}
 }
+
+func TestRommRefreshOnlyAsksForChanges(t *testing.T) {
+	rom := func(id int, updated string, missing bool) string {
+		return `{ "id": ` + strconv.Itoa(id) + `, "platform_id": 10, "name": "Game ` + strconv.Itoa(id) + `", "updated_at": "` + updated +
+			`", "missing_from_fs": ` + strconv.FormatBool(missing) + `, "files": [ { "id": ` + strconv.Itoa(id) + `, "file_name": "g.sfc", "file_size_bytes": 1 } ] }`
+	}
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/platforms":
+			io.WriteString(w, `[ { "id": 10, "slug": "snes", "fs_slug": "snes", "display_name": "SNES", "firmware": [] } ]`)
+		case "/api/roms/identifiers":
+			// Game 1 was deleted. RomM still has 3, but its file is gone.
+			io.WriteString(w, `[2, 3, 4, 900]`)
+		case "/api/roms":
+			queries = append(queries, r.URL.RawQuery)
+			if r.URL.Query().Get("with_rom_id_index") != "false" || r.URL.Query().Get("with_filter_values") != "false" {
+				t.Errorf("listing asks for gallery extras: %s", r.URL.RawQuery)
+			}
+			if r.URL.Query().Has("updated_after") {
+				io.WriteString(w, `{ "items": [`+rom(3, "2026-11-02T08:00:00+00:00", true)+`,`+rom(4, "2026-11-02T09:30:00+00:00", false)+`] }`)
+				return
+			}
+			io.WriteString(w, `{ "items": [`+rom(1, "2026-11-01T10:00:00+00:00", false)+`,`+rom(2, "2026-11-01T10:00:00+00:00", false)+`,`+rom(3, "2026-11-01T09:00:00+00:00", false)+`] }`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	set := rommSettings{url: srv.URL, token: "rmm_good", libraryID: "x"}
+	ids := func(s *rommSnapshot) (out []int) {
+		for _, g := range s.games {
+			out = append(out, g.ID)
+		}
+		return out
+	}
+
+	first, err := loadRomm(context.Background(), set, nil)
+	if err != nil || !slices.Equal(ids(first), []int{1, 2, 3}) {
+		t.Fatalf("full listing = %v, %v", ids(first), err)
+	}
+	second, err := loadRomm(context.Background(), set, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := queries[len(queries)-1]; !strings.Contains(got, "updated_after=2026-11-01T09%3A50%3A00Z") || strings.Contains(got, "platform_ids") {
+		t.Errorf("change query = %s", got)
+	}
+	if !slices.Equal(ids(second), []int{2, 4}) {
+		t.Errorf("after changes = %v, want [2 4]", ids(second))
+	}
+	if want := time.Date(2026, 11, 2, 9, 30, 0, 0, time.UTC); !second.changedUpTo.Equal(want) || !second.fullLoad.Equal(first.fullLoad) {
+		t.Errorf("changedUpTo = %v, fullLoad moved = %v", second.changedUpTo, !second.fullLoad.Equal(first.fullLoad))
+	}
+}

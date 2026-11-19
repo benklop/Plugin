@@ -100,6 +100,11 @@ type rommSnapshot struct {
 	platforms []rommPlatform
 	games     []rommGame
 	loaded    time.Time
+	// changedUpTo is RomM's newest change in the listing, where the next
+	// refresh asks for changes from. fullLoad is when the whole library was
+	// last listed.
+	changedUpTo time.Time
+	fullLoad    time.Time
 }
 
 func parseRommPlatforms(raw []json.RawMessage) []rommPlatform {
@@ -460,8 +465,24 @@ const (
 	rommMaxAge     = 5 * time.Minute
 	rommRetryAfter = 30 * time.Second
 	rommFirstWait  = 10 * time.Second
-	rommLoadLimit  = 2 * time.Minute
+	// A load has no overall cap, since a first listing of a large library
+	// takes minutes. Each request has its own, body included.
+	rommRequestLimit = 2 * time.Minute
+	// RomM stamps changes to the second and a slow write can land a little
+	// behind its stamp, so each refresh asks again for a margin before the
+	// newest change seen. A full listing now and then catches anything that
+	// changed without RomM touching the game's own stamp.
+	rommChangeOverlap = 10 * time.Minute
+	rommFullListAge   = 12 * time.Hour
 )
+
+// rommListingOnly turns off the gallery extras RomM otherwise works out over
+// the whole library for every page, and from RomM 5.5 the raw provider
+// metadata Moonbase never reads. Older RomMs ignore what they lack.
+var rommListingOnly = url.Values{
+	"with_char_index": {"false"}, "with_filter_values": {"false"}, "with_rom_id_index": {"false"},
+	"with_total": {"false"}, "with_provider_metadata": {"false"},
+}
 
 // gamesHTTP has no overall timeout, since it streams whole ROMs. Each JSON
 // call sets its own.
@@ -508,10 +529,9 @@ func (g *games) startRommLoad(set rommSettings, key string) chan struct{} {
 	}
 	done := make(chan struct{})
 	st.loading = done
+	prev := st.snap
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), rommLoadLimit)
-		snap, err := loadRomm(ctx, set)
-		cancel()
+		snap, err := loadRomm(context.Background(), set, prev)
 		st.mu.Lock()
 		if st.key == key {
 			if err != nil {
@@ -544,20 +564,94 @@ func (g *games) rommDiagnostics(set rommSettings) M {
 
 const rommPageSize = 500
 
-func loadRomm(ctx context.Context, set rommSettings) (*rommSnapshot, error) {
+// loadRomm lists the library. Given the last snapshot it only asks RomM for
+// the games changed since and for the ids it still has, so a refresh of a
+// large library costs a few small requests.
+func loadRomm(ctx context.Context, set rommSettings, prev *rommSnapshot) (*rommSnapshot, error) {
 	var raw []json.RawMessage
 	if err := rommGet(ctx, set, "/api/platforms", true, &raw); err != nil {
 		return nil, err
 	}
-	snap := &rommSnapshot{platforms: parseRommPlatforms(raw), loaded: time.Now()}
+	now := time.Now()
+	snap := &rommSnapshot{platforms: parseRommPlatforms(raw), loaded: now, fullLoad: now}
 	if len(snap.platforms) == 0 {
 		return snap, nil
 	}
 	byID := map[int]rommPlatform{}
-	q := url.Values{"with_files": {"true"}, "order_by": {"id"}, "order_dir": {"asc"}, "limit": {strconv.Itoa(rommPageSize)}}
 	for _, p := range snap.platforms {
 		byID[p.ID] = p
+	}
+	// A platform that came or went changes which games are playable at all,
+	// so it takes a full listing.
+	if prev != nil && !prev.changedUpTo.IsZero() && now.Sub(prev.fullLoad) < rommFullListAge && sameRommPlatforms(prev.platforms, snap.platforms) {
+		changed, err := loadRommChanges(ctx, set, prev, snap, byID)
+		var status *rommStatusError
+		if err == nil || !errors.As(err, &status) || (status.status != http.StatusNotFound && status.status != http.StatusUnprocessableEntity) {
+			return changed, err
+		}
+		// A RomM without change filtering or the id list lists everything.
+	}
+	q := url.Values{}
+	for _, p := range snap.platforms {
 		q.Add("platform_ids", strconv.Itoa(p.ID))
+	}
+	newest, err := listRommRoms(ctx, set, q, byID, func(_ int, game rommGame, ok bool) {
+		if ok {
+			snap.games = append(snap.games, game)
+		}
+	})
+	snap.changedUpTo = newest
+	return snap, err
+}
+
+func loadRommChanges(ctx context.Context, set rommSettings, prev, snap *rommSnapshot, byID map[int]rommPlatform) (*rommSnapshot, error) {
+	games := make(map[int]rommGame, len(prev.games))
+	for _, g := range prev.games {
+		games[g.ID] = g
+	}
+	// No platform filter here, so a game that moved to a platform Moonbase
+	// can't play is seen and dropped.
+	since := prev.changedUpTo.UTC().Add(-rommChangeOverlap).Format("2006-01-02T15:04:05Z")
+	newest, err := listRommRoms(ctx, set, url.Values{"updated_after": {since}}, byID, func(id int, game rommGame, ok bool) {
+		if ok {
+			games[id] = game
+		} else {
+			delete(games, id)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A deleted game never shows up as a change, so whatever RomM no longer
+	// lists goes.
+	var ids []int
+	if err := rommGet(ctx, set, "/api/roms/identifiers", true, &ids); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		if g, ok := games[id]; ok {
+			snap.games = append(snap.games, g)
+		}
+	}
+	slices.SortFunc(snap.games, func(a, b rommGame) int { return a.ID - b.ID })
+	snap.fullLoad, snap.changedUpTo = prev.fullLoad, prev.changedUpTo
+	if newest.After(snap.changedUpTo) {
+		snap.changedUpTo = newest
+	}
+	return snap, nil
+}
+
+// listRommRoms pages through /api/roms with a filter, handing each ROM's id
+// and the game it makes (ok false when Moonbase can't play it) to add. It
+// returns the newest change seen.
+func listRommRoms(ctx context.Context, set rommSettings, filter url.Values, byID map[int]rommPlatform, add func(id int, game rommGame, ok bool)) (time.Time, error) {
+	var newest time.Time
+	q := url.Values{"with_files": {"true"}, "order_by": {"id"}, "order_dir": {"asc"}, "limit": {strconv.Itoa(rommPageSize)}}
+	for k, v := range rommListingOnly {
+		q[k] = v
+	}
+	for k, v := range filter {
+		q[k] = v
 	}
 	// The page cap only guards a runaway listing.
 	for page := 0; page < 2000; page++ {
@@ -566,18 +660,31 @@ func loadRomm(ctx context.Context, set rommSettings) (*rommSnapshot, error) {
 			Items []json.RawMessage `json:"items"`
 		}
 		if err := rommGet(ctx, set, "/api/roms?"+q.Encode(), true, &body); err != nil {
-			return nil, err
+			return newest, err
 		}
 		for _, item := range body.Items {
-			if game, ok := parseRommRom(item, byID); ok {
-				snap.games = append(snap.games, game)
+			var head struct {
+				ID        int    `json:"id"`
+				UpdatedAt string `json:"updated_at"`
 			}
+			if json.Unmarshal(item, &head) != nil || head.ID == 0 {
+				continue
+			}
+			if t, err := time.Parse(time.RFC3339Nano, head.UpdatedAt); err == nil && t.After(newest) {
+				newest = t
+			}
+			game, ok := parseRommRom(item, byID)
+			add(head.ID, game, ok)
 		}
 		if len(body.Items) < rommPageSize {
 			break
 		}
 	}
-	return snap, nil
+	return newest, nil
+}
+
+func sameRommPlatforms(a, b []rommPlatform) bool {
+	return slices.EqualFunc(a, b, func(x, y rommPlatform) bool { return x.ID == y.ID && x.Core == y.Core })
 }
 
 type rommStatusError struct {
@@ -601,6 +708,8 @@ var errNotRomm = errors.New("that address answered, but not like a RomM server")
 // rommGet reads one JSON answer. RomM takes its token only as a bearer
 // header, never in the URL.
 func rommGet(ctx context.Context, set rommSettings, pathAndQuery string, authorize bool, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, rommRequestLimit)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, set.url+pathAndQuery, nil)
 	if err != nil {
 		return err

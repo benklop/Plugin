@@ -94,7 +94,7 @@ public static class RommParser
         return result;
     }
 
-    private static RommGame? ParseRom(JsonElement rom, IReadOnlyDictionary<int, RommPlatform> platforms, RommFileRules rules)
+    internal static RommGame? ParseRom(JsonElement rom, IReadOnlyDictionary<int, RommPlatform> platforms, RommFileRules rules)
     {
         var id = Int(rom, "id");
         var platformId = Int(rom, "platform_id");

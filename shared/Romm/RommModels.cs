@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Moonfin.Romm;
 
@@ -98,11 +99,23 @@ public sealed class RommSnapshot
     private readonly Dictionary<int, RommPlatform> _platformsById = new Dictionary<int, RommPlatform>();
     private readonly Dictionary<int, RommGame> _gamesById = new Dictionary<int, RommGame>();
 
-    public RommSnapshot(IReadOnlyList<RommPlatform> platforms, IReadOnlyList<RommGame> games, DateTime loadedUtc)
+    /// <summary>
+    /// <paramref name="changedUpTo"/> is RomM's newest change in the listing, where the next
+    /// refresh asks for changes from. <paramref name="fullLoadUtc"/> is when the whole library
+    /// was last listed, the load time when left out.
+    /// </summary>
+    public RommSnapshot(
+        IReadOnlyList<RommPlatform> platforms,
+        IReadOnlyList<RommGame> games,
+        DateTime loadedUtc,
+        DateTimeOffset? changedUpTo = null,
+        DateTime? fullLoadUtc = null)
     {
         Platforms = platforms;
         Games = games;
         LoadedUtc = loadedUtc;
+        ChangedUpTo = changedUpTo;
+        FullLoadUtc = fullLoadUtc ?? loadedUtc;
         foreach (var platform in platforms)
         {
             _platformsById[platform.Id] = platform;
@@ -119,6 +132,27 @@ public sealed class RommSnapshot
     public IReadOnlyList<RommGame> Games { get; }
 
     public DateTime LoadedUtc { get; }
+
+    public DateTimeOffset? ChangedUpTo { get; }
+
+    public DateTime FullLoadUtc { get; }
+
+    /// <summary>The shared library a linked user's view was cut from.</summary>
+    public RommSnapshot? CutFrom { get; private set; }
+
+    /// <summary>
+    /// The games one RomM user can see and the platforms they are on. RomM hides by ROM (a hidden
+    /// platform hides its ROMs), so the shared library and the user's ROM ids are enough.
+    /// </summary>
+    public RommSnapshot OnlyVisible(ISet<int> visibleIds)
+    {
+        var games = Games.Where(game => visibleIds.Contains(game.Id)).ToList();
+        var platformIds = new HashSet<int>(games.Select(game => game.PlatformId));
+        return new RommSnapshot(Platforms.Where(platform => platformIds.Contains(platform.Id)).ToList(), games, DateTime.UtcNow)
+        {
+            CutFrom = this,
+        };
+    }
 
     public RommPlatform? FindPlatform(int id) => _platformsById.TryGetValue(id, out var platform) ? platform : null;
 

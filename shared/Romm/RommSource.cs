@@ -55,6 +55,7 @@ public sealed class RommSource
     private readonly Func<RommSettings, CancellationToken, Task<RommSnapshot>>? _loadOverride;
     private readonly object _gate = new object();
     private readonly ConcurrentDictionary<Guid, RommSource> _userSources = new ConcurrentDictionary<Guid, RommSource>();
+    private readonly RommSource? _shared;
     private string? _inventorySignature;
     private RommInventory? _inventory;
 
@@ -77,6 +78,22 @@ public sealed class RommSource
         Accounts = accountsFolder == null ? null : new RommAccounts(settings, httpClient, accountsFolder);
     }
 
+    // A linked user's source: the user's token for every call, and the shared library cut down
+    // to the ROMs RomM shows that user, so a new user costs one id list instead of a full listing.
+    private RommSource(RommSource shared, Guid userId)
+        : this(
+            () =>
+            {
+                var settings = shared.Settings;
+                var token = shared.Accounts?.TokenFor(userId);
+                return settings == null || token == null ? null : settings.WithToken(token);
+            },
+            shared._httpClient,
+            shared._rules)
+    {
+        _shared = shared;
+    }
+
     public RommAccounts? Accounts { get; }
 
     /// <summary>Raised when a RomM load changed the games clients see.</summary>
@@ -91,7 +108,25 @@ public sealed class RommSource
     }
 
     /// <summary>The current snapshot, waiting briefly when none has loaded yet.</summary>
-    public RommSnapshot? Snapshot() => CurrentInventory()?.Get();
+    public RommSnapshot? Snapshot()
+    {
+        var inventory = CurrentInventory();
+        if (_shared == null || inventory == null)
+        {
+            return inventory?.Get();
+        }
+
+        // A linked user's view keeps the shared library fresh too, and is cut again once it reloads.
+        var shared = _shared.CurrentInventory();
+        var library = shared?.Current != null ? shared.Get() : null;
+        var snapshot = inventory.Get();
+        if (snapshot != null && library != null && !ReferenceEquals(snapshot.CutFrom, library))
+        {
+            inventory.StartRefresh();
+        }
+
+        return snapshot;
+    }
 
     /// <summary>
     /// True once a snapshot has loaded. Never waits, so background work can skip the library
@@ -149,16 +184,7 @@ public sealed class RommSource
             return this;
         }
 
-        return _userSources.GetOrAdd(userId.Value, id => new RommSource(
-            () =>
-            {
-                var settings = Settings;
-                var token = Accounts.TokenFor(id);
-                return settings == null || token == null ? null : settings.WithToken(token);
-            },
-            _httpClient,
-            _rules,
-            _loadOverride));
+        return _userSources.GetOrAdd(userId.Value, id => new RommSource(this, id));
     }
 
     public RommClient? CreateClient()
@@ -246,6 +272,19 @@ public sealed class RommSource
             : (int?)null;
     }
 
+    private async Task<RommSnapshot> LoadVisibleAsync(RommSettings settings, CancellationToken cancellationToken)
+    {
+        var visible = await new RommClient(_httpClient(), settings.BaseUrl, settings.Token).RomIdsAsync(cancellationToken).ConfigureAwait(false);
+        var shared = _shared!.CurrentInventory();
+        if (shared != null && shared.Current == null && shared.StartRefresh() is { } loading)
+        {
+            await loading.ConfigureAwait(false);
+        }
+
+        var library = shared?.Current ?? throw new InvalidOperationException(shared?.LastError ?? "The RomM library hasn't loaded yet");
+        return library.OnlyVisible(visible);
+    }
+
     private RommInventory? CurrentInventory()
     {
         var settings = Settings;
@@ -258,9 +297,12 @@ public sealed class RommSource
         {
             if (_inventory == null || !string.Equals(_inventorySignature, settings.Signature, StringComparison.Ordinal))
             {
-                var inventory = new RommInventory(cancellationToken => _loadOverride != null
-                    ? _loadOverride(settings, cancellationToken)
-                    : new RommClient(_httpClient(), settings.BaseUrl, settings.Token).LoadAsync(_rules, cancellationToken));
+                RommInventory? inventory = null;
+                inventory = new RommInventory(cancellationToken => _shared != null
+                    ? LoadVisibleAsync(settings, cancellationToken)
+                    : _loadOverride != null
+                        ? _loadOverride(settings, cancellationToken)
+                        : new RommClient(_httpClient(), settings.BaseUrl, settings.Token).LoadAsync(_rules, inventory!.Current, cancellationToken));
                 inventory.Changed += () => Changed?.Invoke();
                 _inventory = inventory;
                 _inventorySignature = settings.Signature;

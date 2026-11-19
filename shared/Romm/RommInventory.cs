@@ -33,7 +33,9 @@ public sealed class RommInventory
         _maxAge = maxAge ?? TimeSpan.FromMinutes(5);
         _retryAfterFailure = retryAfterFailure ?? TimeSpan.FromSeconds(30);
         _firstLoadWait = firstLoadWait ?? TimeSpan.FromSeconds(10);
-        _loadTimeout = loadTimeout ?? TimeSpan.FromMinutes(2);
+        // No overall cap by default: a first listing of a large library takes minutes, and each
+        // RomM request has its own timeout, so a stalled RomM still ends the load.
+        _loadTimeout = loadTimeout ?? Timeout.InfiniteTimeSpan;
     }
 
     /// <summary>Raised after a load that changed what clients see, including the first one.</summary>
