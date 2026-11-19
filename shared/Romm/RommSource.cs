@@ -75,9 +75,13 @@ public sealed class RommSource
         _rules = rules;
         _loadOverride = loadOverride;
         Accounts = accountsFolder == null ? null : new RommAccounts(settings, httpClient, accountsFolder);
+        Streaming = Accounts == null ? null : new RommStreaming(this, httpClient);
     }
 
     public RommAccounts? Accounts { get; }
+
+    /// <summary>Streaming from RomM's emulator containers. Needs users' own RomM links, so null without them.</summary>
+    public RommStreaming? Streaming { get; }
 
     /// <summary>Raised when a RomM load changed the games clients see.</summary>
     public event Action? Changed;

@@ -47,6 +47,7 @@ public static class RommParser
                 Id = id.Value,
                 SystemId = systemId,
                 Name = Text(platform, "display_name") ?? Text(platform, "custom_name") ?? Text(platform, "name") ?? systemId,
+                Slug = slug!,
                 Core = core,
             };
 
@@ -70,6 +71,60 @@ public static class RommParser
 
         return result;
     }
+
+    /// <summary>
+    /// RomM's streaming config. A row needs a platform and emulator. Its label is RomM's play
+    /// button text for the platform ("PCSX2", "RA PPSSPP"), falling back to RomM's emulator label
+    /// table, then the emulator id.
+    /// </summary>
+    public static RommStreamingConfig ParseStreamingConfig(JsonElement root)
+    {
+        var config = new RommStreamingConfig();
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            return config;
+        }
+
+        config.Enabled = Bool(root, "enabled");
+        root.TryGetProperty("emulator_labels", out var labels);
+        foreach (var row in Items(root, "containers"))
+        {
+            var platform = Text(row, "platform");
+            var emulator = Text(row, "emulator");
+            if (platform == null || emulator == null || config.Platforms.ContainsKey(platform))
+            {
+                continue;
+            }
+
+            config.Platforms[platform] = new RommStreamingPlatform
+            {
+                Platform = platform,
+                Emulator = emulator,
+                Label = Text(row, "label")
+                    ?? (labels.ValueKind == JsonValueKind.Object ? Text(labels, emulator) : null)
+                    ?? emulator,
+            };
+        }
+
+        return config;
+    }
+
+    public static RommStreamClaim? ParseStreamClaim(JsonElement root)
+    {
+        var platform = Text(root, "platform");
+        var container = Text(root, "container");
+        var claimedAt = Text(root, "claimed_at");
+        return platform == null || container == null || claimedAt == null
+            ? null
+            : new RommStreamClaim { Platform = platform, Container = container, ClaimedAt = claimedAt, Label = Text(root, "label") ?? string.Empty };
+    }
+
+    public static RommStreamStatus ParseStreamStatus(JsonElement root) => new RommStreamStatus
+    {
+        Active = Text(root, "status") == "active",
+        Host = Text(root, "host"),
+        Phase = Text(root, "extraction_phase"),
+    };
 
     public static List<RommGame> ParseRoms(
         JsonElement items,

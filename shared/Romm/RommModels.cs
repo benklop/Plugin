@@ -24,6 +24,9 @@ public sealed class RommPlatform
 
     public string Name { get; set; } = string.Empty;
 
+    /// <summary>RomM's platform slug, like psx. RomM's streaming config is keyed on it.</summary>
+    public string Slug { get; set; } = string.Empty;
+
     public string Core { get; set; } = string.Empty;
 
     public List<RommFile> Firmware { get; set; } = new List<RommFile>();
@@ -218,4 +221,48 @@ public sealed class RommDeviceLink
     public int ExpiresInSeconds { get; }
 
     public int IntervalSeconds { get; }
+}
+
+/// <summary>What RomM's streaming config says, as one user sees it.</summary>
+public sealed class RommStreamingConfig
+{
+    public bool Enabled { get; set; }
+
+    /// <summary>One row per streamable platform, keyed on RomM's platform slug.</summary>
+    public Dictionary<string, RommStreamingPlatform> Platforms { get; set; } =
+        new Dictionary<string, RommStreamingPlatform>(StringComparer.OrdinalIgnoreCase);
+}
+
+public sealed class RommStreamingPlatform
+{
+    public string Platform { get; set; } = string.Empty;
+
+    /// <summary>The emulator RomM runs for the platform, like duckstation.</summary>
+    public string Emulator { get; set; } = string.Empty;
+
+    /// <summary>What RomM's own player calls the emulator, like DuckStation.</summary>
+    public string Label { get; set; } = string.Empty;
+}
+
+/// <summary>A container RomM reserved for a session. The game launches in the background.</summary>
+public sealed class RommStreamClaim
+{
+    public string Platform { get; set; } = string.Empty;
+
+    public string Container { get; set; } = string.Empty;
+
+    public string Label { get; set; } = string.Empty;
+
+    public string ClaimedAt { get; set; } = string.Empty;
+}
+
+public sealed class RommStreamStatus
+{
+    public bool Active { get; set; }
+
+    /// <summary>The room's address once the game is up, absolute or a path on RomM's origin.</summary>
+    public string? Host { get; set; }
+
+    /// <summary>Set while RomM's broker unpacks a large game before launch.</summary>
+    public string? Phase { get; set; }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -56,10 +57,13 @@ public sealed class RommAccounts
 {
     // Leaves out me.write, which would let a stored token change the user's RomM password. The
     // cost is that the plugin can't revoke its own token, so unlinking only forgets it.
+    // roms.user.write starts, keeps alive and ends the user's streaming sessions.
     private static readonly string[] Scopes =
     {
-        "roms.read", "platforms.read", "firmware.read", "assets.read", "assets.write", "me.read",
+        "roms.read", "platforms.read", "firmware.read", "assets.read", "assets.write", "me.read", "roms.user.write",
     };
+
+    private const string StreamingScope = "roms.user.write";
 
     private readonly Func<RommSettings?> _settings;
     private readonly Func<HttpClient> _http;
@@ -76,6 +80,13 @@ public sealed class RommAccounts
 
     /// <summary>The user's token for the RomM server configured now, or null.</summary>
     public string? TokenFor(Guid userId) => LinkedAccount(userId, _settings())?.Token;
+
+    /// <summary>
+    /// Whether the user's link asked RomM for the streaming scope. Links made before streaming
+    /// recorded no scopes, so the user links again once to stream.
+    /// </summary>
+    public bool CanStream(Guid userId) =>
+        LinkedAccount(userId, _settings())?.Scopes?.Contains(StreamingScope, StringComparer.Ordinal) == true;
 
     /// <summary>The user's link, after asking RomM whether a pending one was approved.</summary>
     public async Task<RommAccountStatus> StatusAsync(Guid userId, CancellationToken cancellationToken)
@@ -177,7 +188,7 @@ public sealed class RommAccounts
                 // The link works without a name, so a failed lookup only leaves it blank.
             }
 
-            Save(userId, new StoredAccount { BaseUrl = settings.BaseUrl, Token = token, Username = username });
+            Save(userId, new StoredAccount { BaseUrl = settings.BaseUrl, Token = token, Username = username, Scopes = Scopes });
             Forget(userId, pending);
             return null;
         }
@@ -265,6 +276,10 @@ public sealed class RommAccounts
 
         [JsonPropertyName("username")]
         public string? Username { get; set; }
+
+        /// <summary>The scopes the link asked for. Null on links saved before this was kept.</summary>
+        [JsonPropertyName("scopes")]
+        public string[]? Scopes { get; set; }
     }
 
     private sealed class PendingLink

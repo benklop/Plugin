@@ -105,18 +105,7 @@ public sealed class RommClient
     /// </summary>
     public async Task<RommServerInfo> CheckAsync(CancellationToken cancellationToken)
     {
-        string? version = null;
-        using (var heartbeat = await GetJsonAsync("/api/heartbeat", cancellationToken, authorize: false).ConfigureAwait(false))
-        {
-            if (heartbeat.RootElement.ValueKind == JsonValueKind.Object &&
-                heartbeat.RootElement.TryGetProperty("SYSTEM", out var system) &&
-                system.ValueKind == JsonValueKind.Object &&
-                system.TryGetProperty("VERSION", out var value) &&
-                value.ValueKind == JsonValueKind.String)
-            {
-                version = value.GetString();
-            }
-        }
+        var version = await GetVersionAsync(cancellationToken).ConfigureAwait(false);
 
         using var platforms = await GetJsonAsync("/api/platforms", cancellationToken).ConfigureAwait(false);
         var supported = RommParser.ParsePlatforms(platforms.RootElement);
@@ -137,7 +126,8 @@ public sealed class RommClient
             }
         }
 
-        return new RommServerInfo(version, platformCount, supported.Count, supportedRomCount);
+        var streaming = await RommStreaming.PlatformsForTestAsync(this, version, cancellationToken).ConfigureAwait(false);
+        return new RommServerInfo(version, platformCount, supported.Count, supportedRomCount, streaming);
     }
 
     /// <summary>The caller disposes the response.</summary>
@@ -301,6 +291,63 @@ public sealed class RommClient
     public Task<RommAsset> UploadStateAsync(int romId, string emulator, string fileName, byte[] data, CancellationToken cancellationToken) =>
         UploadAsync($"/api/states?rom_id={romId}&emulator={Uri.EscapeDataString(emulator)}", "stateFile", fileName, data, cancellationToken);
 
+    /// <summary>The server's version from the open heartbeat, or null when it doesn't say.</summary>
+    public async Task<string?> GetVersionAsync(CancellationToken cancellationToken)
+    {
+        using var heartbeat = await GetJsonAsync("/api/heartbeat", cancellationToken, authorize: false).ConfigureAwait(false);
+        return heartbeat.RootElement.ValueKind == JsonValueKind.Object &&
+            heartbeat.RootElement.TryGetProperty("SYSTEM", out var system) &&
+            system.ValueKind == JsonValueKind.Object
+            ? RommParser.Text(system, "VERSION")
+            : null;
+    }
+
+    /// <summary>Which platforms stream for the token's user. Off for a user without RomM's streaming grant.</summary>
+    public async Task<RommStreamingConfig> GetStreamingConfigAsync(CancellationToken cancellationToken)
+    {
+        using var document = await GetJsonAsync("/api/streaming/config", cancellationToken).ConfigureAwait(false);
+        return RommParser.ParseStreamingConfig(document.RootElement);
+    }
+
+    /// <summary>
+    /// Reserves a container for the game. RomM answers at once and launches in the background, so
+    /// the room's address comes from <see cref="GetStreamStatusAsync"/> later.
+    /// </summary>
+    public async Task<RommStreamClaim> ClaimStreamAsync(int romId, CancellationToken cancellationToken)
+    {
+        const string path = "/api/streaming/sessions";
+        using var document = await SendJsonAsync(HttpMethod.Post, path, new Dictionary<string, object> { ["rom_id"] = romId }, cancellationToken).ConfigureAwait(false);
+        return RommParser.ParseStreamClaim(document.RootElement) ?? throw new RommRequestException(502, path);
+    }
+
+    public async Task<RommStreamStatus> GetStreamStatusAsync(string platform, string claimedAt, CancellationToken cancellationToken)
+    {
+        using var document = await GetJsonAsync(SessionPath(platform, "/status", null, claimedAt), cancellationToken).ConfigureAwait(false);
+        return RommParser.ParseStreamStatus(document.RootElement);
+    }
+
+    /// <summary>Keeps the session. RomM frees a container that goes three minutes without one.</summary>
+    public async Task<RommStreamStatus> HeartbeatStreamAsync(string platform, string container, string claimedAt, CancellationToken cancellationToken)
+    {
+        using var document = await SendJsonAsync(HttpMethod.Post, SessionPath(platform, "/heartbeat", container, claimedAt), null, cancellationToken).ConfigureAwait(false);
+        return RommParser.ParseStreamStatus(document.RootElement);
+    }
+
+    /// <summary>Saves and ends the session without waiting for the save, which RomM finishes on its own.</summary>
+    public async Task ExitStreamAsync(string platform, string container, string claimedAt, CancellationToken cancellationToken)
+    {
+        using var document = await SendJsonAsync(
+            HttpMethod.Post,
+            SessionPath(platform, "/save-and-exit", container, claimedAt),
+            new Dictionary<string, object> { ["wait"] = false },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static string SessionPath(string platform, string action, string? container, string claimedAt) =>
+        "/api/streaming/sessions/" + Uri.EscapeDataString(platform) + action + "?" +
+        (container == null ? string.Empty : "container=" + Uri.EscapeDataString(container) + "&") +
+        "claimed_at=" + Uri.EscapeDataString(claimedAt);
+
     /// <summary>
     /// The full URL of a RomM artwork file. Only RomM's public asset folder is accepted, so a
     /// path from RomM can't point the plugin's downloader anywhere else.
@@ -349,6 +396,21 @@ public sealed class RommClient
         return RommParser.ParseAsset(document.RootElement) ?? throw new RommRequestException(502, pathAndQuery);
     }
 
+    private async Task<JsonDocument> SendJsonAsync(HttpMethod method, string pathAndQuery, object? body, CancellationToken cancellationToken)
+    {
+        using var request = NewRequest(method, pathAndQuery, authorize: true);
+        request.Headers.Accept.ParseAdd("application/json");
+        request.Content = new StringContent(body == null ? "{}" : JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+        using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        var text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new RommRequestException((int)response.StatusCode, pathAndQuery, text);
+        }
+
+        return JsonDocument.Parse(string.IsNullOrWhiteSpace(text) ? "{}" : text);
+    }
+
     private async Task<JsonDocument> GetJsonAsync(string pathAndQuery, CancellationToken cancellationToken, bool authorize = true)
     {
         using var request = NewRequest(HttpMethod.Get, pathAndQuery, authorize);
@@ -377,13 +439,17 @@ public sealed class RommClient
 
 public sealed class RommServerInfo
 {
-    public RommServerInfo(string? version, int platformCount, int supportedPlatformCount, int supportedRomCount)
+    public RommServerInfo(string? version, int platformCount, int supportedPlatformCount, int supportedRomCount, string[]? streamingPlatforms = null)
     {
         Version = version;
         PlatformCount = platformCount;
         SupportedPlatformCount = supportedPlatformCount;
         SupportedRomCount = supportedRomCount;
+        StreamingPlatforms = streamingPlatforms;
     }
+
+    /// <summary>The platform slugs RomM streams, or null when its streaming is off or too old for Moonfin.</summary>
+    public string[]? StreamingPlatforms { get; }
 
     public string? Version { get; }
 
@@ -396,13 +462,17 @@ public sealed class RommServerInfo
 
 public sealed class RommRequestException : Exception
 {
-    public RommRequestException(int statusCode, string pathAndQuery)
+    public RommRequestException(int statusCode, string pathAndQuery, string? body = null)
         : base(DescribeStatus(statusCode) + " (" + PathOnly(pathAndQuery) + ")")
     {
         StatusCode = statusCode;
+        Body = body;
     }
 
     public int StatusCode { get; }
+
+    /// <summary>RomM's error body, kept where its details matter, such as a busy container.</summary>
+    public string? Body { get; }
 
     private static string DescribeStatus(int statusCode) => statusCode switch
     {

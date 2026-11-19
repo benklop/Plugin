@@ -33,6 +33,7 @@ public partial class GamesService
     private readonly ILogger<GamesService> _logger;
 
     private const string EmulatorJsBackend = "emulatorjs";
+    private const string StreamBackend = "stream";
 
     internal static readonly Regex AutoDetectLibraryName =
         new("game|rom|emulat", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -773,7 +774,8 @@ public partial class GamesService
             return null;
         }
 
-        if (!string.IsNullOrWhiteSpace(backend) &&
+        var isStream = string.Equals(backend, StreamBackend, StringComparison.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(backend) && !isStream &&
              !string.Equals(backend, EmulatorJsBackend, StringComparison.OrdinalIgnoreCase))
         {
             throw new ArgumentException("The requested game backend is not available.", nameof(backend));
@@ -781,18 +783,28 @@ public partial class GamesService
 
         if (_romm?.Owns(libraryId) == true)
         {
-            var rommGame = _romm.ForUser(userId).FindGame(gameId);
-            if (rommGame == null)
+            if (_romm.ForUser(userId).FindGameAndPlatform(gameId) is not (var rommGame, var rommPlatform))
             {
                 return null;
+            }
+
+            if (isStream && (_romm.Streaming == null ||
+                (await _romm.Streaming.OfferAsync(userId, rommPlatform, cancellationToken).ConfigureAwait(false))?.Label == null))
+            {
+                throw new ArgumentException("This game can't stream for this user.", nameof(backend));
             }
 
             await _gameBackendOverrides.SetAsync(
                 userId,
                 RommBackendPreferenceKey(rommGame),
-                string.IsNullOrWhiteSpace(backend) ? null : EmulatorJsBackend,
+                string.IsNullOrWhiteSpace(backend) ? null : isStream ? StreamBackend : EmulatorJsBackend,
                 cancellationToken).ConfigureAwait(false);
             return await BuildRommDetailAsync(gameId, userId, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (isStream)
+        {
+            throw new ArgumentException("Only RomM games stream.", nameof(backend));
         }
 
         var resolution = await ResolveGameAsync(libraryId, gameId, cancellationToken).ConfigureAwait(false);
@@ -939,7 +951,14 @@ public partial class GamesService
         var backendOverride = userId.HasValue && _gameBackendOverrides != null
             ? await _gameBackendOverrides.GetAsync(userId.Value, RommBackendPreferenceKey(game), cancellationToken).ConfigureAwait(false)
             : null;
-        if (!string.Equals(backendOverride, EmulatorJsBackend, StringComparison.Ordinal))
+        var stream = _romm.Streaming == null
+            ? null
+            : await _romm.Streaming.OfferAsync(userId, platform, cancellationToken).ConfigureAwait(false);
+
+        // A stream choice only holds while the game can still stream, such as before RomM's admin
+        // drops the platform's container. The app then falls back to its normal player.
+        if (!string.Equals(backendOverride, EmulatorJsBackend, StringComparison.Ordinal) &&
+            !(string.Equals(backendOverride, StreamBackend, StringComparison.Ordinal) && stream?.Label != null))
         {
             backendOverride = null;
         }
@@ -962,6 +981,7 @@ public partial class GamesService
                 .ToList(),
             UserBackendOverride = backendOverride,
             BackendOverrideSupported = _gameBackendOverrides != null,
+            Stream = stream,
             Overview = game.Summary,
             Genre = game.Genre,
             Developer = game.Developer,

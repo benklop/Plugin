@@ -168,6 +168,10 @@ public sealed class GamesControllerArtworkContractTests
             [nameof(GamesController.GetRommAccount)] = null,
             [nameof(GamesController.LinkRommAccount)] = null,
             [nameof(GamesController.UnlinkRommAccount)] = null,
+            [nameof(GamesController.StartStream)] = null,
+            [nameof(GamesController.GetStream)] = null,
+            [nameof(GamesController.HeartbeatStream)] = null,
+            [nameof(GamesController.EndStream)] = null,
         };
 
     public static IEnumerable<object?[]> GamesControllerActionPolicyCases() =>

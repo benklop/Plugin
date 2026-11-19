@@ -659,6 +659,51 @@ namespace Emby.Plugins.Moonfin.Api
             return Json(Plugin.Instance?.Romm?.Accounts?.Unlink(userId.Value) ?? new RommAccountStatus());
         }
 
+        // Streaming a RomM game from RomM's emulator containers, as the user's own RomM account.
+        public Task<object> Post(StartGameStreamRequest request) =>
+            StreamCallAsync(request.LibraryId, request.GameId, async (streaming, userId, game, platform) =>
+                Json(await streaming.StartAsync(userId, game, platform, Request.CancellationToken).ConfigureAwait(false)));
+
+        public Task<object> Get(GetGameStreamRequest request) =>
+            StreamCallAsync(request.LibraryId, request.GameId, async (streaming, userId, game, platform) =>
+                Json(await streaming.StatusAsync(userId, platform, request.SessionId, Request.CancellationToken).ConfigureAwait(false)));
+
+        public Task<object> Post(HeartbeatGameStreamRequest request) =>
+            StreamCallAsync(request.LibraryId, request.GameId, async (streaming, userId, game, platform) =>
+                Json(await streaming.HeartbeatAsync(userId, platform, request.SessionId, Request.CancellationToken).ConfigureAwait(false)));
+
+        public Task<object> Delete(EndGameStreamRequest request) =>
+            StreamCallAsync(request.LibraryId, request.GameId, async (streaming, userId, game, platform) =>
+            {
+                await streaming.ExitAsync(userId, platform, request.SessionId, Request.CancellationToken).ConfigureAwait(false);
+                Request.Response.StatusCode = 204;
+                return null!;
+            });
+
+        private async Task<object> StreamCallAsync(
+            string libraryId,
+            string gameId,
+            Func<RommStreaming, Guid, RommGame, RommPlatform, Task<object>> call)
+        {
+            var userId = AuthHelpers.GetCurrentUserId(Request, _authContext);
+            if (userId == null) return Json(401, new { error = "User not authenticated" });
+            var root = Plugin.Instance?.Romm;
+            if (!GamesEnabled() || root?.Streaming == null || !root.Owns(libraryId) ||
+                root.ForUser(userId).FindGameAndPlatform(gameId) is not (var game, var platform))
+            {
+                return NotFound();
+            }
+
+            try
+            {
+                return await call(root.Streaming, userId.Value, game, platform).ConfigureAwait(false);
+            }
+            catch (RommStreamException e)
+            {
+                return Json(e.StatusCode, e.Body);
+            }
+        }
+
         public async Task<object> Post(TestRommRequest request)
         {
             var romm = Romm();
@@ -678,6 +723,7 @@ namespace Emby.Plugins.Moonfin.Api
                     PlatformCount = info.PlatformCount,
                     SupportedPlatformCount = info.SupportedPlatformCount,
                     SupportedRomCount = info.SupportedRomCount,
+                    StreamingPlatforms = info.StreamingPlatforms,
                 });
             }
             catch (Exception ex) when (ex is JsonException || ex is RommRequestException { StatusCode: 404 })

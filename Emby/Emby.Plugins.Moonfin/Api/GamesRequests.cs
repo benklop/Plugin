@@ -128,6 +128,41 @@ namespace Emby.Plugins.Moonfin.Api
     {
     }
 
+    [Route("/Moonfin/Games/{LibraryId}/Games/{GameId}/Stream", "POST")]
+    [Authenticated]
+    public class StartGameStreamRequest : IReturn<object>
+    {
+        public string LibraryId { get; set; } = string.Empty;
+        public string GameId { get; set; } = string.Empty;
+    }
+
+    [Route("/Moonfin/Games/{LibraryId}/Games/{GameId}/Stream/{SessionId}", "GET")]
+    [Authenticated]
+    public class GetGameStreamRequest : IReturn<object>
+    {
+        public string LibraryId { get; set; } = string.Empty;
+        public string GameId { get; set; } = string.Empty;
+        public string SessionId { get; set; } = string.Empty;
+    }
+
+    [Route("/Moonfin/Games/{LibraryId}/Games/{GameId}/Stream/{SessionId}/Heartbeat", "POST")]
+    [Authenticated]
+    public class HeartbeatGameStreamRequest : IReturn<object>
+    {
+        public string LibraryId { get; set; } = string.Empty;
+        public string GameId { get; set; } = string.Empty;
+        public string SessionId { get; set; } = string.Empty;
+    }
+
+    [Route("/Moonfin/Games/{LibraryId}/Games/{GameId}/Stream/{SessionId}", "DELETE")]
+    [Authenticated]
+    public class EndGameStreamRequest : IReturn<object>
+    {
+        public string LibraryId { get; set; } = string.Empty;
+        public string GameId { get; set; } = string.Empty;
+        public string SessionId { get; set; } = string.Empty;
+    }
+
     [Route("/Moonfin/Games/Romm/Test", "POST")]
     [Authenticated(Roles = "Admin")]
     public class TestRommRequest : IReturn<object>

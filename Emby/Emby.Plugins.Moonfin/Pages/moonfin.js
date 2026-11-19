@@ -685,7 +685,10 @@ define(['baseView', 'loading', 'emby-input', 'emby-button', 'emby-checkbox', 'em
                     }
                     statusEl.textContent = 'Connected to RomM' + (result.version ? ' ' + result.version : '') + '. ' +
                         result.supportedPlatformCount + ' of its ' + result.platformCount + ' platforms play in Moonfin, with ' +
-                        result.supportedRomCount + ' games between them.';
+                        result.supportedRomCount + ' games between them.' +
+                        (result.streamingPlatforms && result.streamingPlatforms.length
+                            ? ' Streams from RomM: ' + result.streamingPlatforms.join(', ') + '.'
+                            : '');
                 })
                 .catch(function () { statusEl.textContent = 'The test failed.'; })
                 .finally(function () { button.disabled = false; });

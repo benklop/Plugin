@@ -930,6 +930,7 @@ public class GamesController : ControllerBase
                 PlatformCount = info.PlatformCount,
                 SupportedPlatformCount = info.SupportedPlatformCount,
                 SupportedRomCount = info.SupportedRomCount,
+                StreamingPlatforms = info.StreamingPlatforms,
             });
         }
         catch (Exception ex) when (ex is JsonException or RommRequestException { StatusCode: StatusCodes.Status404NotFound })
@@ -999,6 +1000,92 @@ public class GamesController : ControllerBase
         }
 
         return Ok(_romm.Accounts?.Unlink(userId.Value) ?? new RommAccountStatus());
+    }
+
+    /// <summary>
+    /// Starts streaming a RomM game from one of RomM's emulator containers, as the signed-in
+    /// user's own RomM account. RomM launches it in the background: poll the session for its room.
+    /// </summary>
+    [HttpPost("{libraryId}/Games/{gameId}/Stream")]
+    [Authorize]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    public Task<IActionResult> StartStream(
+        [FromRoute] string libraryId,
+        [FromRoute] string gameId,
+        CancellationToken cancellationToken) =>
+        StreamCallAsync(libraryId, gameId, async (streaming, userId, game, platform) =>
+            Ok(await streaming.StartAsync(userId, game, platform, cancellationToken).ConfigureAwait(false)));
+
+    /// <summary>The session's state: starting, ready with the room's address, or ended.</summary>
+    [HttpGet("{libraryId}/Games/{gameId}/Stream/{sessionId}")]
+    [Authorize]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public Task<IActionResult> GetStream(
+        [FromRoute] string libraryId,
+        [FromRoute] string gameId,
+        [FromRoute] string sessionId,
+        CancellationToken cancellationToken) =>
+        StreamCallAsync(libraryId, gameId, async (streaming, userId, game, platform) =>
+            Ok(await streaming.StatusAsync(userId, platform, sessionId, cancellationToken).ConfigureAwait(false)));
+
+    /// <summary>Keeps the session. RomM ends one that goes three minutes without a heartbeat.</summary>
+    [HttpPost("{libraryId}/Games/{gameId}/Stream/{sessionId}/Heartbeat")]
+    [Authorize]
+    [Produces(MediaTypeNames.Application.Json)]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public Task<IActionResult> HeartbeatStream(
+        [FromRoute] string libraryId,
+        [FromRoute] string gameId,
+        [FromRoute] string sessionId,
+        CancellationToken cancellationToken) =>
+        StreamCallAsync(libraryId, gameId, async (streaming, userId, game, platform) =>
+            Ok(await streaming.HeartbeatAsync(userId, platform, sessionId, cancellationToken).ConfigureAwait(false)));
+
+    /// <summary>Saves the game in RomM and ends the session.</summary>
+    [HttpDelete("{libraryId}/Games/{gameId}/Stream/{sessionId}")]
+    [Authorize]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public Task<IActionResult> EndStream(
+        [FromRoute] string libraryId,
+        [FromRoute] string gameId,
+        [FromRoute] string sessionId,
+        CancellationToken cancellationToken) =>
+        StreamCallAsync(libraryId, gameId, async (streaming, userId, game, platform) =>
+        {
+            await streaming.ExitAsync(userId, platform, sessionId, cancellationToken).ConfigureAwait(false);
+            return NoContent();
+        });
+
+    private async Task<IActionResult> StreamCallAsync(
+        string libraryId,
+        string gameId,
+        Func<RommStreaming, Guid, RommGame, RommPlatform, Task<IActionResult>> call)
+    {
+        var userId = this.GetUserIdFromClaims();
+        if (userId == null)
+        {
+            return Unauthorized();
+        }
+
+        if (!GamesEnabled() || _romm.Streaming == null || !_romm.Owns(libraryId) ||
+            _romm.ForUser(userId).FindGameAndPlatform(gameId) is not (var game, var platform))
+        {
+            return NotFound();
+        }
+
+        try
+        {
+            return await call(_romm.Streaming, userId.Value, game, platform).ConfigureAwait(false);
+        }
+        catch (RommStreamException e)
+        {
+            return StatusCode(e.StatusCode, e.Body);
+        }
     }
 
     private async Task<IActionResult> ServeRommRomAsync(string gameId, CancellationToken cancellationToken)

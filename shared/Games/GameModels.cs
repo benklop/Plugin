@@ -215,8 +215,9 @@ public class RecentGame : GameSummary
 public class GameDetail : GameSummary
 {
     /// <summary>
-    /// Explicit per-user player backend selection. Currently <c>emulatorjs</c>; null means
-    /// follow the client's native-core preference and normal fallback rules.
+    /// Explicit per-user player backend selection: <c>emulatorjs</c>, or <c>stream</c> for a RomM
+    /// game that can stream. Null means follow the client's native-core preference and normal
+    /// fallback rules.
     /// </summary>
     [JsonPropertyName("userBackendOverride")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -230,6 +231,14 @@ public class GameDetail : GameSummary
     /// </summary>
     [JsonPropertyName("backendOverrideSupported")]
     public bool BackendOverrideSupported { get; set; }
+
+    /// <summary>
+    /// Set when this RomM game can stream from one of RomM's emulator containers for this user,
+    /// or when the user must link RomM again to stream it. Absent everywhere else.
+    /// </summary>
+    [JsonPropertyName("stream")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Moonfin.Romm.RommStreamOffer? Stream { get; set; }
 
     /// <summary>
     /// Explicit per-user arcade core selection. Null means the effective <see cref="GameSummary.Core"/>
@@ -333,6 +342,11 @@ public class RommTestResult
 
     [JsonPropertyName("supportedRomCount")]
     public int SupportedRomCount { get; set; }
+
+    /// <summary>The platforms RomM streams from its emulator containers, or null when none do.</summary>
+    [JsonPropertyName("streamingPlatforms")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string[]? StreamingPlatforms { get; set; }
 
     [JsonPropertyName("error")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
