@@ -33,7 +33,9 @@ public sealed class RommInventory
         _maxAge = maxAge ?? TimeSpan.FromMinutes(5);
         _retryAfterFailure = retryAfterFailure ?? TimeSpan.FromSeconds(30);
         _firstLoadWait = firstLoadWait ?? TimeSpan.FromSeconds(10);
-        _loadTimeout = loadTimeout ?? TimeSpan.FromMinutes(2);
+        // Each RomM request has its own timeout, so this only bounds a load that keeps answering.
+        // A large library takes a while: 46,000 games is about 90 pages of 5 MB each.
+        _loadTimeout = loadTimeout ?? TimeSpan.FromMinutes(15);
     }
 
     /// <summary>Raised after a load that changed what clients see, including the first one.</summary>
